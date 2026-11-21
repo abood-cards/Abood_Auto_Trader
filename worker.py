@@ -97,7 +97,11 @@ class TradingWorker:
                     probe_at = now+3
                 else:
                     candidates = [a for a, enabled in scanner.catalog.items() if enabled and a != scanner.discard]
-                    candidate = min(candidates, key=lambda a:checked.get(a,0), default=None)
+                    preferred = self.repo.doc['trading']['asset']
+                    if not checked and preferred != scanner.discard and scanner.catalog.get(preferred, True):
+                        candidate = preferred
+                    else:
+                        candidate = min(candidates, key=lambda a:checked.get(a,0), default=None)
                     if candidate:
                         checked[candidate] = now
                         async with asyncio.timeout(4):
@@ -294,8 +298,13 @@ class TradingWorker:
         except AccountConfigError as exc:
             source = str(exc)
         if po and po.connected:
-            market = 'تكات غير مستلمة' if not s.ticks_received else 'تكات وصلت؛ راجع عداد البث الحديث'
-            diag = f'\nالمصادقة: {int(po.auth_seen)} | إطارات الرصيد: {po.balance_events} | {market}'
+            clock = s.last_clock.status() if s.last_clock else {}
+            reason = clock.get('clock_status','WAITING_FOR_LIVE_TICKS')
+            offset = clock.get('clock_offset_seconds')
+            correction = '—' if offset is None else f'{offset/3600:+g}h'
+            diag = (f'\nالمصادقة: {int(po.auth_seen)} | أحداث الحساب: {po.balance_events} | مصدر الرصيد: {po.balance_source}'
+                    f'\nالتكات المستلمة: {s.ticks_received} | المقبولة: {s.accepted}'
+                    f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
         return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'

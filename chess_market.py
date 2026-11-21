@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import math
 import re
 import time
+from tick_clock import TickClock
+from collections import Counter
 
 
 def otc(value):
@@ -126,8 +128,13 @@ class Series:
 
 
 class Scanner:
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, mono=time.monotonic):
         self.clock = clock
+        self.mono = mono
+        self.clocks = {}
+        self.rejected = Counter()
+        self.accepted = 0
+        self.last_clock = None
         self.series = {}
         self.catalog = {}
         self.verified = set()
@@ -139,6 +146,7 @@ class Scanner:
 
     def clear(self):
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
+        self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def feed(self, event):
         if not isinstance(event,list) or len(event)<2:
@@ -150,7 +158,7 @@ class Scanner:
                     self.catalog[asset] = str(enabled).lower() not in ('0','false','0.0')
         if not isinstance(name,str) or name.lower() != 'updatestream':
             return
-        now = self.clock()
+        now, mono = self.clock(), self.mono()
         for asset, raw_ts, raw_price in extract_ticks(data):
             self.ticks_received += 1
             ts, price = num(raw_ts), num(raw_price)
@@ -158,10 +166,22 @@ class Scanner:
                 continue
             if ts > 1e11:
                 ts /= 1000
-            if ts < now-3 or ts > now+0.5 or not self.catalog.get(asset, True):
+            if not self.catalog.get(asset, True):
+                self.rejected['ASSET_DISABLED'] += 1
                 continue
-            if asset not in self.series and len(self.series) >= 4096:
+            if asset not in self.clocks and len(self.clocks) >= 4096:
                 continue
+            if asset not in self.clocks:
+                self.clocks[asset] = TickClock()
+            clock = self.last_clock = self.clocks[asset]
+            ts = clock.normalize(ts,now,mono)
+            if ts is None:
+                self.rejected[clock.reason] += 1
+                if clock.reason != 'DUPLICATE_OR_REVERSED_TICK':
+                    self.series.pop(asset,None)
+                    self.entries = deque((e for e in self.entries if e.asset != asset),maxlen=128)
+                continue
+            self.accepted += 1
             self.verified.add(asset)
             series = self.series.setdefault(asset, Series())
             if series.bar and ts <= series.bar.last:

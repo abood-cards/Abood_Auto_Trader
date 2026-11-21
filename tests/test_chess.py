@@ -13,7 +13,7 @@ from worker import TradingWorker
 class MarketTests(unittest.TestCase):
     def setup_bars(self, colors, early=False, gap=False):
         clock=[6000.0]
-        s=Scanner(lambda:clock[0]); s.enabled=True; s.early=early
+        s=Scanner(lambda:clock[0], lambda:clock[0]); s.enabled=True; s.early=early
         a='USDINR_otc'
         s.feed(['updateAssets',[{'asset':a,'enabled':True},{'asset':'#AAPL_otc','enabled':True},{'asset':'EURUSD','enabled':True}]])
         def tick(ts,p):

@@ -8,6 +8,34 @@ from wire_decoder import EventDecoder, payload_json
 from payout_guard import flag
 from chess_market import Scanner, extract_ticks, num
 
+AUTH_EVENTS = {'successauth','success_auth'}
+BALANCE_EVENTS = AUTH_EVENTS | {'profile','updateprofile','updatebalance','successupdatebalance','balance','balances'}
+SCOPED = {'demobalance': True,'practicebalance': True,'realbalance': False}
+UNKNOWN = object()
+
+
+def balance_rows(payload, inherited=None, depth=0):
+    if depth > 8:
+        return
+    if isinstance(payload,dict):
+        mode = inherited
+        if 'isDemo' in payload:
+            mode = flag(payload['isDemo'])
+            if mode is None:
+                mode = UNKNOWN
+        for key,value in payload.items():
+            if isinstance(value,(dict,list)):
+                yield from balance_rows(value,mode,depth+1)
+                continue
+            key = key.replace('_','').lower()
+            if key == 'balance':
+                yield mode, num(value)
+            elif key in SCOPED and (mode is None or mode is SCOPED[key]):
+                yield SCOPED[key],num(value)
+    elif isinstance(payload,list):
+        for value in payload:
+            yield from balance_rows(value,inherited,depth+1)
+
 
 class Decoder(EventDecoder):
     def feed(self, raw):
@@ -19,7 +47,7 @@ class Decoder(EventDecoder):
             data = payload_json(raw)
             if isinstance(data,dict):
                 name = data.get('event')
-                if isinstance(name,str) and name.lower() in ('updatestream','successauth','profile','updateprofile','updatebalance','balance','balances'):
+                if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream'}):
                     return [[name,data.get('data',data.get('payload',{}))]]
             if isinstance(data, list) and any(extract_ticks(data)):
                 return [['updateStream', data]]
@@ -112,6 +140,8 @@ class ChessPocket(CloudPocket):
         self.account_verified = False
         self.wrong_mode = False
         self.auth_seen = False
+        self.sent_mode = None
+        self.balance_source = "—"
         self.balance_events = 0
         self.subscription_requests = 0
         self.verified_balance = None
@@ -122,11 +152,18 @@ class ChessPocket(CloudPocket):
         self.account_verified = self.wrong_mode = self.auth_seen = False
         self.result = None
         self.trackers.clear()
+        self.sent_mode = None
+        self.balance_source = "—"
         self.balance_events = 0
         self.subscription_requests = 0
         self.verified_balance = None
         self.verified_balance_at = 0.0
         await super().connect()
+
+    def _build_auth_frame(self):
+        frame = super()._build_auth_frame()
+        self.sent_mode = flag(json.loads(frame[2:])[1].get('isDemo'))
+        return frame
 
     def process(self, event):
         if not isinstance(event,list) or len(event)<2 or not isinstance(event[0],str):
@@ -134,40 +171,34 @@ class ChessPocket(CloudPocket):
         name,payload = event[:2]
         expected = self.mode == 'PRACTICE'
         kind = name.lower()
-        if kind == 'successauth':
-            self.auth_seen = True
-        account_event = kind in ('successauth','profile','updateprofile','updatebalance','balance','balances')
-        scoped = {'demobalance': True, 'practicebalance': True, 'realbalance': False}
-        if account_event:
-            rows = list(records(payload))
-            if any(any(str(k).replace('_','').lower() in {'balance', *scoped} for k in row) for row in rows):
-                self.balance_events += 1
-            for row in rows:
-                for k,v in row.items():
-                    if str(k).replace('_','').lower() in scoped and scoped[str(k).replace('_','').lower()] is expected and self.auth_seen and not self.wrong_mode and not ('isDemo' in row and flag(row['isDemo']) is not expected):
-                        value = num(v)
-                        if value is not None and value >= 0:
-                            self.account_verified = True
-                            self.verified_balance = self.balance = value
-                            self.verified_balance_at = time.monotonic()
-                if 'isDemo' not in row:
-                    continue
-                seen = flag(row['isDemo'])
-                if seen is expected:
-                    self.account_verified = not self.wrong_mode
-                    # A nested balance explicitly tagged with the selected mode.
-                    value = num(row.get('balance'))
-                    if value is not None and value >= 0 and self.account_verified:
-                        self.verified_balance = self.balance = value
-                        self.verified_balance_at = time.monotonic()
-                elif seen is not None and kind == 'successauth' and row is payload:
-                    self.wrong_mode = True
-                    self.account_verified = False
-        if isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
+        if kind in AUTH_EVENTS:
+            if isinstance(payload,dict) and (payload.get('success') is False or payload.get('error')):
+                self.wrong_mode = True
+            if isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
+                self.wrong_mode = True
+            self.auth_seen = not self.wrong_mode
+        if self.wrong_mode:
+            self.account_verified = False
+            self.balance = self.verified_balance = None
             return
-        if account_event:
-            # Only balances attributed to the selected account reach the order gate.
-            self.balance = self.verified_balance if self.account_verified and not self.wrong_mode else None
+        if kind in BALANCE_EVENTS:
+            self.balance_events += 1
+            rows = [(mode,value) for mode,value in balance_rows(payload) if value is not None and value >= 0]
+            tagged = {value for mode,value in rows if mode is expected}
+            # Local bot fallback: untagged balance on the same explicitly
+            # authenticated demo socket. Never apply this fallback to REAL.
+            untagged = {value for mode,value in rows if mode is None}
+            scoped = bool(tagged)
+            allowed = tagged if self.auth_seen else set()
+            if not allowed and expected and self.auth_seen and self.sent_mode is True and all(mode is None for mode,_ in rows):
+                allowed = untagged
+            if len(allowed) == 1:
+                self.verified_balance = self.balance = next(iter(allowed))
+                self.account_verified = True
+                self.balance_source = 'محدد النوع' if scoped else 'جلسة ديمو مؤكدة'
+                self.verified_balance_at = time.monotonic()
+        if kind not in BALANCE_EVENTS and isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
+            return
         self.scanner.feed(event)
         if not self.wrong_mode:
             for tracked in self.trackers:

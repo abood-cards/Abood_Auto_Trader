@@ -125,10 +125,11 @@ class CloudPocket(PocketOptionWS):
                     for event in self.decoder.feed(msg):
                         if not isinstance(event, list) or not event:
                             continue
-                        if event[0] in ('failauth', 'errorauth', 'authError'):
+                        name = str(event[0]).lower()
+                        if name in ('failauth', 'errorauth', 'autherror'):
                             raise SafeIssue('PO_AUTH_REJECTED')
                         self.process(event)
-                        authenticated = event[0] == 'successauth' or self.balance is not None
+                        authenticated = authenticated or name in ('successauth','success_auth') or self.balance is not None
                 self.connected = True
                 self._recv_task = asyncio.create_task(self._receiver_loop())
         except BaseException:
