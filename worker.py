@@ -9,7 +9,7 @@ from chess_transport import ChessPocket
 from render_accounts import resolve_account, AccountConfigError
 from risk_limits import risk_state
 from diagnostics import SafeIssue
-from payout_guard import scan_payout
+from payout_guard import scan_payout, SCAN_PAYOUT_MIN, SCAN_PAYOUT_MAX
 
 PAYOUT_REFRESH_INTERVAL = 60
 import scan_scope
@@ -37,6 +37,7 @@ class TradingWorker:
         self.last_signal = '—'
         self.refresh_attempts = 0
         self.last_refresh = float('-inf')
+        self.qualified_before = set()
 
     @property
     def pending(self):
@@ -78,6 +79,7 @@ class TradingWorker:
             self.stop_event.clear()
             self.cursor = None
             self.refresh_attempts = 0
+            self.qualified_before.clear()
             self.last_refresh = float('-inf')
             self.stage = 'اتصال'
             self.task = asyncio.create_task(self.run())
@@ -112,6 +114,18 @@ class TradingWorker:
             return not book.quotes
         codes = {self.payout(asset)[0] for asset in scoped}
         return 'KNOWN' not in codes and bool(codes & {'STALE','NO_TABLE','ASSET_MISSING'})
+
+    def keep_warming(self, asset):
+        code,rate=self.payout(asset)
+        if code=='KNOWN':
+            self.qualified_before.add(asset)
+            return True
+        # A previously qualified live feed may keep collecting ticks. A stale
+        # quote NEVER authorizes a new subscription, candidate or order.
+        if code=='STALE' and rate is not None and SCAN_PAYOUT_MIN<=rate<=SCAN_PAYOUT_MAX:
+            return asset in self.qualified_before
+        self.qualified_before.discard(asset)
+        return False
 
     def focus_selected(self, asset):
         self.cursor = asset
@@ -290,7 +304,7 @@ class TradingWorker:
                     scanner.eligible = lambda asset: self.repo.leader and not self.stop_event.is_set() and not self.focus and self.payout(asset)[0]=='KNOWN'
                     scanner.track_price = lambda asset: (asset == self.focus
                         or (scanner.locked is not None and asset == scanner.locked[0])
-                        or self.payout(asset)[0]=='KNOWN')
+                        or self.keep_warming(asset))
                     scanner.on_select = self.focus_selected
                     probe = asyncio.create_task(self.probe())
                     delay = 1
@@ -362,6 +376,8 @@ class TradingWorker:
     def status(self):
         po = self.po
         s = po.scanner if po else None
+        live_depths = [s.series[a].ready_depth() for a in s.active_assets() if self.payout(a)[0]=='KNOWN'] if s else []
+        ready = sum(d>=4 for d in live_depths)
         coverage = (f'الأصول المكتشفة: {sum(s.catalog.values())} | بث حديث: {s.active_count()} | أصول لديها شمعة M1 مكتملة: {s.coverage()}' if s else 'لم يبدأ المسح')
         focus = self.focus or '—'
         live = s.active_assets() if s else []
@@ -402,5 +418,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status}\nمحاولات تحديث العائد: {self.refresh_attempts}\nآخر نموذج مغلق: {self.last_signal}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status}\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))

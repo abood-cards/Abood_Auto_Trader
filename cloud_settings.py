@@ -112,8 +112,8 @@ def validate_document(doc):
     validate_recovery(doc.get('recovery', recovery_defaults()), t['trade_amount'])
     if t['duration_seconds'] not in DURATIONS:
         raise ValueError('مدة غير مدعومة في قائمة البوت')
-    if isinstance(t['martingale_steps'], bool) or t['martingale_steps'] not in range(5):
-        raise ValueError('خطوات التدبيل بين 0 و4')
+    if type(t['martingale_steps']) is not int or t['martingale_steps'] not in range(9):
+        raise ValueError('مستويات التدبيل بين 0 و8')
     for key in ('entry_delay_seconds', 'loop_delay_seconds', 'result_timeout_extra',
                 'balance_settle_seconds', 'loss_recheck_seconds'):
         valid_number(t[key], 0, 120)

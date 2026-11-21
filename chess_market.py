@@ -91,6 +91,16 @@ class Series:
         self.closed = deque(maxlen=8)
         self.bar = None
 
+    def ready_depth(self):
+        next_minute = self.bar.minute if self.bar else None
+        count = 0
+        for candle in reversed(self.closed):
+            if not candle.good or next_minute != candle.minute + 60:
+                break
+            count += 1
+            next_minute = candle.minute
+        return min(count,5)
+
     @staticmethod
     def expected(bars):
         """Four closed bars: tail of a same-colour run followed by alternation."""
@@ -147,6 +157,8 @@ class Scanner:
         self.track_price = lambda asset: True
         self.payout_filtered = Counter()
         self.last_second = False
+        self.closed_checks = Counter()
+        self.last_closed = '—'
         self.on_select = lambda asset: None
         self.locked = None
         self.last_wait = '—'
@@ -161,6 +173,7 @@ class Scanner:
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
         self.groups.clear(); self.locked = None; self.last_candidate = None; self.last_wait = '—'
         self.payout_filtered.clear(); self.last_second = False
+        self.closed_checks.clear(); self.last_closed = '—'
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def feed(self, event):
@@ -178,6 +191,7 @@ class Scanner:
         if not isinstance(name,str) or name.lower() != 'updatestream':
             return
         now, mono = self.clock(), self.mono()
+        held_at_start = self.locked[0] if self.locked else None
         for asset, raw_ts, raw_price in extract_ticks(data):
             self.ticks_received += 1
             ts, price = num(raw_ts), num(raw_price)
@@ -202,7 +216,7 @@ class Scanner:
             ts = clock.normalize(ts,now,mono)
             if ts is None:
                 self.rejected[clock.reason] += 1
-                if clock.reason != 'DUPLICATE_OR_REVERSED_TICK':
+                if clock.reason == 'LOCAL_CLOCK_CHANGED_RECALIBRATING':
                     self.series.pop(asset,None)
                     self.entries = deque((e for e in self.entries if e.asset != asset),maxlen=128)
                 continue
@@ -213,7 +227,7 @@ class Scanner:
                 continue
             rolled = series.tick(ts, price)
             bar = series.bar
-            if not self.enabled or self.discard == asset:
+            if not self.enabled or self.discard == asset or (held_at_start is not None and asset != held_at_start):
                 continue
             if self.eligible is not None:
                 if self.locked:
@@ -229,7 +243,21 @@ class Scanner:
                             self.last_wait = f'{asset}: ' + ('أغلق بالنمط لكن العائد غير مؤهل' if direction else 'إغلاق معاكس أو شمعة غير مكتملة')
                         self.locked = None
                     continue
-                if self.entries or self.last_candidate == (asset,bar.minute+60) or not self.eligible(asset):
+                if self.entries or not self.eligible(asset):
+                    continue
+                if rolled and bar.minute <= now < bar.minute+3 and self.last_candidate != (asset,bar.minute):
+                    depth = series.ready_depth()
+                    direction = series.direction(series.closed) if depth >= 5 else None
+                    code = 'MATCH' if direction else ('PATTERN' if depth >= 5 else 'WARMUP')
+                    self.closed_checks[code] += 1
+                    self.last_closed = f'{asset}: {depth}/5 | {code}'
+                    if direction:
+                        self.last_candidate = (asset,bar.minute)
+                        self.on_select(asset)
+                        self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
+                        self.last_wait = f'{asset}: تطابق عند الإغلاق'
+                        continue
+                if self.last_candidate == (asset,bar.minute+60):
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
