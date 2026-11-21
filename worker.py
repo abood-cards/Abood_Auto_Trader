@@ -87,13 +87,13 @@ class TradingWorker:
         probe_at = 0.0
         while self.po.connected and not self.stop_event.is_set():
             now = time.monotonic()
-            if not self.focus and not self.po.wrong_mode and now >= probe_at:
+            if not self.focus and not scanner.entries and not self.po.wrong_mode and now >= probe_at:
                 latest = scanner.series.get(candidate)
                 # If changeSymbol replaces the stream, retain a live symbol long
-                # enough for five complete candles before rotating again.
+                # enough for four complete candles before rotating again.
                 fresh = scanner.active_count()
                 _, _, forming = scanner.forming()
-                if (forming is not None and forming == candidate) or (latest and latest.bar and time.time()-latest.bar.last <= 5 and fresh < 2 and now-checked.get(candidate,0) < 370 and scanner.discard != candidate):
+                if (forming is not None and forming == candidate) or (latest and latest.bar and time.time()-latest.bar.last <= 5 and fresh < 2 and now-checked.get(candidate,0) < 310 and scanner.discard != candidate):
                     probe_at = now+3
                 else:
                     candidates = [a for a, enabled in scanner.catalog.items() if enabled and a != scanner.discard]
@@ -210,6 +210,7 @@ class TradingWorker:
     async def run(self):
         delay = 1
         previous_asset = None
+        avoid_until = 0.0
         try:
             while not self.stop_event.is_set():
                 if risk_state(self.repo.doc)['reason']:
@@ -240,8 +241,7 @@ class TradingWorker:
                             self.stop_event.set()
                             break
                         scanner.enabled = bool(self.po.account_verified and self.po.verified_balance is not None)
-                        scanner.early = self.repo.doc['chess']['early']
-                        scanner.discard = previous_asset if len([a for a,on in scanner.catalog.items() if on]) > 1 else None
+                        scanner.discard = previous_asset if time.monotonic() < avoid_until and any(a != previous_asset and on for a,on in scanner.catalog.items()) else None
                         self.stage = 'مسح M1' if scanner.enabled else 'مسح للقراءة فقط — انتظار تأكيد نوع الحساب والرصيد'
                         if probe.done():
                             probe.result()
@@ -252,8 +252,9 @@ class TradingWorker:
                                 scanner.entries.clear()
                                 await self.chain(entry,deepcopy(self.repo.doc))
                                 previous_asset = entry.asset
+                                avoid_until = time.monotonic() + 15
                                 self.focus = None
-                        await asyncio.sleep(.05 if scanner.early else .1)
+                        await asyncio.sleep(.05)
                 except Exception as exc:
                     print('[CHESS]',type(exc).__name__,flush=True)
                     if self.pending:
@@ -286,8 +287,17 @@ class TradingWorker:
     def status(self):
         po = self.po
         s = po.scanner if po else None
-        coverage = (f'الأصول المكتشفة: {sum(s.catalog.values())} | بث حديث: {s.active_count()} | شموع M1 مكتملة: {s.coverage()}' if s else 'لم يبدأ المسح')
+        coverage = (f'الأصول المكتشفة: {sum(s.catalog.values())} | بث حديث: {s.active_count()} | أصول لديها شمعة M1 مكتملة: {s.coverage()}' if s else 'لم يبدأ المسح')
         focus = self.focus or '—'
+        live = s.active_assets() if s else []
+        receiving = ', '.join(live[:4]) + (f' (+{len(live)-4})' if len(live) > 4 else '') if live else '—'
+        preferred = self.repo.doc['trading']['asset']
+        watched = preferred if preferred in live else live[0] if live else None
+        series = s.series.get(watched) if watched else None
+        colors = {1:'🟢', -1:'🔴', 0:'⚪'}
+        candles = ' '.join(colors[b.color] if b.good else '▫️' for b in list(series.closed)[-3:]) if series else ''
+        if series and series.bar:
+            candles = f'{candles or "—"} | الحالية: {colors[series.bar.color]}'
         count, _, forming = s.forming() if s else (0,0,None)
         formation = f'{forming} ({count}/4)' if forming else '—'
         account = ('مطابق' if po.account_verified else 'لم يرد تأكيد مطابق') if po else '—'
@@ -307,5 +317,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nأولوية المسح: {preferred} | بث مستلم: {receiving}\nآخر 3 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))

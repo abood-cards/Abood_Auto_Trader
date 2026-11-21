@@ -11,14 +11,14 @@ from worker import TradingWorker
 
 
 class MarketTests(unittest.TestCase):
-    def setup_bars(self, colors, early=False, gap=False):
+    def setup_bars(self, colors, gap=False):
         clock=[6000.0]
-        s=Scanner(lambda:clock[0], lambda:clock[0]); s.enabled=True; s.early=early
-        a='USDINR_otc'
+        s=Scanner(lambda:clock[0], lambda:clock[0]); s.enabled=True
+        a='AUDCAD_otc'
         s.feed(['updateAssets',[{'asset':a,'enabled':True},{'asset':'#AAPL_otc','enabled':True},{'asset':'EURUSD','enabled':True}]])
         def tick(ts,p):
             clock[0]=ts
-            s.feed(['updateStream',[[a,ts*1000+0, p]]]) if ts>1e8 else s.feed(['updateStream',[[a,ts,p]]])
+            s.feed(['updateStream',[[a,ts,p]]])
         for i,c in enumerate(colors):
             t=6000+i*60
             for sec in [0.2,8,16,24,32,40,48,56,59.3]:
@@ -27,24 +27,34 @@ class MarketTests(unittest.TestCase):
                 tick(t+sec,100 if sec<55 else 100+c)
         return s, tick, 6000+60*len(colors)
 
-    def test_sell_long_run(self):
-        s,t,end=self.setup_bars([-1,-1,-1,1,-1,1]); self.assertFalse(s.entries)
+    def test_sell_four(self):
+        s,t,end=self.setup_bars([-1,1,-1,1]); self.assertFalse(s.entries)
         t(end+.2,100); self.assertEqual(s.entries.popleft().direction,'SELL')
         self.assertEqual(len(s.catalog),2)
 
-    def test_buy(self):
-        s,t,end=self.setup_bars([1,1,-1,1,-1],early=True)
-        self.assertFalse(s.entries); t(end+.2,100)
-        self.assertEqual(s.entries.popleft().direction,'BUY')
+    def test_buy_close_regardless_of_preceding_green(self):
+        for pattern in ([1,-1,1,-1], [1,1,-1,1,-1]):
+            with self.subTest(pattern=pattern):
+                s,t,end=self.setup_bars(pattern)
+                self.assertFalse(s.entries)
+                self.assertEqual(s.forming()[::2],(3,'AUDCAD_otc'))
+                t(end+.2,100); t(end+.2,999); t(end+.5,101)
+                self.assertEqual(len(s.entries),1)
+                e=s.entries.popleft()
+                self.assertEqual((e.asset,e.direction,e.boundary,e.early),('AUDCAD_otc','BUY',end,False))
 
-    def test_early_once(self):
-        s,t,end=self.setup_bars([-1,-1,1,-1,1],early=True)
-        self.assertTrue(s.entries[0].early); t(end+.2,100)
-        self.assertEqual(len(s.entries),1)
+    def test_open_red_reverses_before_close(self):
+        s,t,end=self.setup_bars([1,-1,1,-1]); t(end-.2,101); t(end+.2,100)
+        self.assertFalse(s.entries)
 
     def test_break_doji_gaps(self):
-        for colors,gap in [([-1,-1,1,1,-1],False),([-1,-1,1,0,1],False),([-1,-1,1,-1,1],True),([-1,1,-1,1],False)]:
+        for colors,gap in [([1,-1,-1,1],False),([-1,1,0,1],False),([-1,1,-1,1],True),([1,-1,1],False)]:
             s,t,end=self.setup_bars(colors,gap=gap); t(end+.2,100)
+            self.assertFalse(s.entries)
+
+    def test_missing_minute_or_late_boundary(self):
+        for seconds in (4,60.2):
+            s,t,end=self.setup_bars([1,-1,1,-1]); t(end+seconds,100)
             self.assertFalse(s.entries)
 
     def test_stale_future_duplicates_and_ms(self):
@@ -56,7 +66,7 @@ class MarketTests(unittest.TestCase):
 
     def test_partial_pattern(self):
         s,t,end=self.setup_bars([-1,-1,1,-1]); t(end+.2,100)
-        self.assertEqual(s.forming()[::2],(3,'USDINR_otc'))
+        self.assertEqual(s.forming()[::2],(3,'AUDCAD_otc'))
 
     def test_binary_and_unnamed(self):
         d=Decoder(); raw=b'[["EURUSD_otc",1700000000,1.1]]'
@@ -110,6 +120,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             return item
         w.po=SimpleNamespace(scanner=s,balance=1000,send_order=AsyncMock(return_value=True),settlement=settle)
         return w,Entry('USDINR_otc','SELL',int(now),now+3,False)
+
+    async def test_audcad_pattern_dispatches_one_buy(self):
+        scanner,tick,end = MarketTests().setup_bars([1,-1,1,-1])
+        self.assertFalse(scanner.entries)
+        tick(end+.2,100)
+        w,_ = self.mock_worker([('win',.9)])
+        w.po.scanner = scanner
+        with patch('worker.time.time',return_value=end+.2):
+            await w.chain(scanner.entries.popleft(),w.repo.doc)
+        w.po.send_order.assert_awaited_once()
+        order = w.po.send_order.await_args.args[0]
+        self.assertEqual((order['asset'],order['action'],order['amount']),('AUDCAD_otc','call',1))
+        self.assertFalse(scanner.entries)
+
+    async def test_audcad_priority_accepts_chart_name(self):
+        from control_bot import preferred_asset
+        asset=preferred_asset('AUD/CAD OTC')
+        self.assertEqual(asset,'AUDCAD_otc')
+        self.assertEqual(patched(defaults(),{'trading.asset':asset})['trading']['asset'],asset)
 
     async def test_regular_ladder_then_one_enhancement(self):
         w,e=self.mock_worker([('loss',-1),('loss',-2),('loss',-4),('loss',-8),('loss',-2)])

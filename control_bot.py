@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from cloud_settings import auth_frame, valid_number, valid_url
 from payout_guard import flag
+from forex_assets import STORED_ASSET_NAMES
 import config
 from worker import account_key
 from render_accounts import resolve_account, AccountConfigError
@@ -37,13 +38,23 @@ BACK = (('🏠 الرئيسية','home'),)
 SETTINGS = buttons((('👤 إدارة الحسابات','accounts'),),
                    (('💵 الأساس','edit:amount'),('🪜 مستويات التدبيل','edit:steps')),
                    (('🛟 تشغيل/إيقاف التعزيز','boost'),('➕ زيادة التعزيز','edit:increment')),
-                   (('⏱ بيع آخر ثانية/بعد الإغلاق','early'),),
+                   (('🔎 زوج أولوية المسح','edit:asset'),),
                    (('⚡ تدبيل استباقي (ديمو فقط)','early_double'),),
                    (('🛡 تشغيل/إيقاف الحدود','limits'),),
                    (('حد الربح','edit:profit'),('حد الخسارة','edit:loss')),BACK)
-FIELDS = {'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً بمسافة ثم SSID الخام.', 'url':'أرسل رابط WebSocket للديمو.',
+FIELDS = {'asset':'أرسل الزوج مثل AUD/CAD أو AUDCAD_otc. أوقف البوت أولاً، ثم شغّله بعد الحفظ.', 'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً بمسافة ثم SSID الخام.', 'url':'أرسل رابط WebSocket للديمو.',
           'amount':'أرسل مبلغ الأساس بالدولار (0.01–100000).', 'steps':'أرسل عدد المستويات من 0 إلى 4. القيمة 4 تعني أساس + 3 مضاعفات.',
           'increment':'أرسل الزيادة فوق الأساس بالدولار.', 'profit':'أرسل حد الربح بالدولار.', 'loss':'أرسل حد الخسارة بالدولار.'}
+
+
+def preferred_asset(raw):
+    compact = raw.upper().replace('/', '').replace(' ', '').replace('(', '').replace(')', '')
+    if compact.endswith('OTC'):
+        compact = compact[:-3].rstrip('_')
+    asset = compact + '_otc'
+    if asset not in STORED_ASSET_NAMES:
+        raise ValueError('unknown_asset')
+    return asset
 
 
 def settings_text(d):
@@ -54,7 +65,7 @@ def settings_text(d):
         source = str(exc)
     return (f"⚙️ M1 — {d['account_mode']}\nالأساس: ${t['trade_amount']:g} | المستويات: {t['martingale_steps']}\n"
             f"التعزيز: {'مفعّل' if r['mode']=='ENABLED' else 'معطّل'} | +${r['increment']:g}\n"
-            f"الدخول المبكر للبيع: {'مفعّل' if d['chess']['early'] else 'معطّل'}\n"
+            f"زوج الأولوية: {t['asset']} | الدخول بعد الإغلاق\n"
             f"التدبيل الاستباقي للديمو: {'مفعّل' if d['chess']['early_double'] else 'معطّل'}\n"
             f"الحدود: {'مفعّلة' if k['mode']=='LIMITED' else 'معطّلة'} | +${k['profit_limit']:g} / −${k['loss_limit']:g}\n"
             f"مصدر الاتصال: {source}")
@@ -129,12 +140,11 @@ def build_dispatcher(repo, worker, bot):
                 await panel(cb,settings_text(repo.doc),SETTINGS)
             elif action=='early_double' and not repo.doc['chess']['early_double']:
                 await panel(cb,'التدبيل الاستباقي تجريبي فقط: قد تفتح صفقتان وتتغير نتيجة الأولى قبل إغلاقها.', buttons((('تفعيل في الديمو','early_double:confirm'),),BACK))
-            elif action in ('boost','early','limits','early_double','early_double:confirm'):
+            elif action in ('boost','limits','early_double','early_double:confirm'):
                 d=repo.doc
                 changes={'boost':{'recovery.mode':'TRADITIONAL' if d['recovery']['mode']=='ENABLED' else 'ENABLED'},
                          'early_double':{'chess.early_double':False},
                          'early_double:confirm':{'chess.early_double':True},
-                         'early':{'chess.early':not d['chess']['early']},
                          'limits':{'risk.mode':'TRADITIONAL' if d['risk']['mode']=='LIMITED' else 'LIMITED'}}
                 await repo.update(changes[action])
                 await panel(cb,settings_text(repo.doc),SETTINGS)
@@ -187,6 +197,12 @@ def build_dispatcher(repo, worker, bot):
                     if (worker.task and not worker.task.done()) or worker.pending:
                         raise ValueError
                     await repo.update({account_key(mode)+'.ws_url':valid_url(raw)})
+            elif key=='asset':
+                symbol = preferred_asset(raw)
+                async with worker.lock:
+                    if (worker.task and not worker.task.done()) or worker.pending:
+                        raise ValueError
+                    await repo.update({'trading.asset':symbol})
             elif key=='steps':
                 await repo.update({'trading.martingale_steps':int(raw)})
             elif key in ('amount','increment','profit','loss'):

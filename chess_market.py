@@ -93,20 +93,27 @@ class Series:
     def __init__(self):
         self.closed = deque(maxlen=8)
         self.bar = None
-        self.early_boundary = None
 
     @staticmethod
-    def direction(bars):
-        # Last two same-colored candles are the end of the initial run, not
-        # the start of a long run. A doji, bad data or missing minute breaks it.
-        if len(bars) < 5:
+    def expected(bars):
+        """Last three consecutive, complete bars must alternate."""
+        bars = list(bars)[-3:]
+        if len(bars) != 3 or not all(b.good for b in bars):
+            return 0
+        if any(b.minute-a.minute != 60 for a,b in zip(bars,bars[1:])):
+            return 0
+        a,b,c = (bar.color for bar in bars)
+        return -a if a and (b,c) == (-a,a) else 0
+
+    @classmethod
+    def direction(cls, bars):
+        bars = list(bars)[-4:]
+        if len(bars) != 4:
             return None
-        bars = list(bars)[-5:]
-        if not all(b.good for b in bars) or any(b.minute-a.minute != 60 for a,b in zip(bars,bars[1:])):
-            return None
-        a,b,c,d,e = [x.color for x in bars]
-        if a and (a,b,c,d,e) == (a,a,-a,a,-a):
-            return 'BUY' if a == 1 else 'SELL'
+        last = bars[-1]
+        expected = cls.expected(bars[:3])
+        if expected and last.good and last.minute == bars[-2].minute + 60 and last.color == expected:
+            return 'BUY' if expected == -1 else 'SELL'
         return None
 
     def tick(self, ts, price):
@@ -140,7 +147,6 @@ class Scanner:
         self.verified = set()
         self.entries = deque(maxlen=128)
         self.enabled = False
-        self.early = False
         self.discard = None
         self.ticks_received = 0
 
@@ -190,42 +196,31 @@ class Scanner:
             bar = series.bar
             if not self.enabled or self.discard == asset:
                 continue
-            if rolled:
+            if rolled and now <= bar.minute+3:
                 direction = series.direction(series.closed)
-                if direction and series.early_boundary != bar.minute and now <= bar.minute+3:
+                if direction:
                     self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
-            elif self.early:
-                end = bar.minute+60
-                if end-1 <= ts < end and end-1 <= now < end and series.early_boundary != end:
-                    direction = series.direction([*series.closed,bar])
-                    if direction == 'SELL':
-                        series.early_boundary = end
-                        self.entries.append(Entry(asset,direction,end,end,True))
 
     def forming(self):
-        """Best current candidate after at least one alternating closed bar."""
+        """Track a candidate without assuming the open candle's final color."""
         now = self.clock()
         candidates = []
         for asset, series in self.series.items():
-            if asset == self.discard or not self.catalog.get(asset, True) or not series.bar or now-series.bar.last > 10:
+            bar = series.bar
+            if asset == self.discard or not self.catalog.get(asset, True) or not bar or now-bar.last > 10:
                 continue
-            closed = list(series.closed)
-            for size in (4, 3):
-                tail = closed[-size:]
-                if len(tail) != size or not all(b.good for b in tail):
-                    continue
-                if tail[-1].minute+60 != series.bar.minute or any(b.minute-a.minute != 60 for a,b in zip(tail,tail[1:])):
-                    continue
-                color = tail[0].color
-                expected = [color,color,-color,color][:size]
-                if color and [b.color for b in tail] == expected:
-                    candidates.append((size-1,series.bar.last,asset))
-                    break
+            closed = series.closed
+            if closed and closed[-1].minute+60 == bar.minute and series.expected(closed):
+                candidates.append((3,bar.last,asset))
         return max(candidates, default=(0,0,None))
 
-    def active_count(self):
+    def active_assets(self):
         now = self.clock()
-        return sum(s.bar is not None and now-s.bar.last <= 10 and self.catalog.get(a,True) for a,s in self.series.items())
+        return sorted(a for a,s in self.series.items() if s.bar is not None
+                      and now-s.bar.last <= 10 and self.catalog.get(a,True))
+
+    def active_count(self):
+        return len(self.active_assets())
 
     def coverage(self):
         now = self.clock()
