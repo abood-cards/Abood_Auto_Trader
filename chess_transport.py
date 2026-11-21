@@ -13,10 +13,14 @@ class Decoder(EventDecoder):
     def feed(self, raw):
         pending = self.pending
         events = super().feed(raw)
-        if events or pending or (isinstance(raw,str) and not raw.lstrip().startswith('[[')):
+        if events or pending or (isinstance(raw,str) and not raw.lstrip().startswith(('[','{'))):
             return events
         try:
             data = payload_json(raw)
+            if isinstance(data,dict):
+                name = data.get('event')
+                if isinstance(name,str) and name.lower() in ('updatestream','successauth','profile','updateprofile','updatebalance','balance','balances'):
+                    return [[name,data.get('data',data.get('payload',{}))]]
             if isinstance(data, list) and any(extract_ticks(data)):
                 return [['updateStream', data]]
         except (ValueError, TypeError, UnicodeError, RecursionError, zlib.error):
@@ -32,7 +36,7 @@ def records(data):
         node = stack.pop()
         if isinstance(node,dict):
             yield node
-            stack.extend(v for k,v in node.items() if k in ('data','deals','orders','result','deal','order') and isinstance(v,(dict,list)))
+            stack.extend(v for k,v in node.items() if k in ('data','deals','orders','result','deal','order','user','account','accounts','profile','balances') and isinstance(v,(dict,list)))
         elif isinstance(node,list):
             stack.extend(node[:4096])
 
@@ -108,6 +112,7 @@ class ChessPocket(CloudPocket):
         self.account_verified = False
         self.wrong_mode = False
         self.auth_seen = False
+        self.balance_events = 0
         self.subscription_requests = 0
         self.verified_balance = None
         self.verified_balance_at = 0.0
@@ -117,6 +122,7 @@ class ChessPocket(CloudPocket):
         self.account_verified = self.wrong_mode = self.auth_seen = False
         self.result = None
         self.trackers.clear()
+        self.balance_events = 0
         self.subscription_requests = 0
         self.verified_balance = None
         self.verified_balance_at = 0.0
@@ -130,9 +136,20 @@ class ChessPocket(CloudPocket):
         kind = name.lower()
         if kind == 'successauth':
             self.auth_seen = True
-        account_event = kind in ('successauth','profile','updateprofile','updatebalance')
+        account_event = kind in ('successauth','profile','updateprofile','updatebalance','balance','balances')
+        scoped = {'demobalance': True, 'practicebalance': True, 'realbalance': False}
         if account_event:
-            for row in records(payload):
+            rows = list(records(payload))
+            if any(any(str(k).replace('_','').lower() in {'balance', *scoped} for k in row) for row in rows):
+                self.balance_events += 1
+            for row in rows:
+                for k,v in row.items():
+                    if str(k).replace('_','').lower() in scoped and scoped[str(k).replace('_','').lower()] is expected and self.auth_seen and not self.wrong_mode and not ('isDemo' in row and flag(row['isDemo']) is not expected):
+                        value = num(v)
+                        if value is not None and value >= 0:
+                            self.account_verified = True
+                            self.verified_balance = self.balance = value
+                            self.verified_balance_at = time.monotonic()
                 if 'isDemo' not in row:
                     continue
                 seen = flag(row['isDemo'])
@@ -148,14 +165,9 @@ class ChessPocket(CloudPocket):
                     self.account_verified = False
         if isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
             return
-        if name in ('successauth','profile','updateProfile','updateBalance'):
-            super().process(event)
-            if isinstance(payload,dict) and self.account_verified and not self.wrong_mode:
-                value = num(payload.get('balance'))
-                if value is not None and value >= 0:
-                    self.verified_balance = value
-                    self.verified_balance_at = time.monotonic()
-            self.balance = self.verified_balance if self.account_verified else self.balance
+        if account_event:
+            # Only balances attributed to the selected account reach the order gate.
+            self.balance = self.verified_balance if self.account_verified and not self.wrong_mode else None
         self.scanner.feed(event)
         if not self.wrong_mode:
             for tracked in self.trackers:

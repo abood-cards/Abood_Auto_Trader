@@ -135,9 +135,10 @@ class Scanner:
         self.enabled = False
         self.early = False
         self.discard = None
+        self.ticks_received = 0
 
     def clear(self):
-        self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear()
+        self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
 
     def feed(self, event):
         if not isinstance(event,list) or len(event)<2:
@@ -147,10 +148,11 @@ class Scanner:
             for asset, enabled in extract_catalog(data):
                 if len(self.catalog) < 4096 or asset in self.catalog:
                     self.catalog[asset] = str(enabled).lower() not in ('0','false','0.0')
-        if name != 'updateStream':
+        if not isinstance(name,str) or name.lower() != 'updatestream':
             return
         now = self.clock()
         for asset, raw_ts, raw_price in extract_ticks(data):
+            self.ticks_received += 1
             ts, price = num(raw_ts), num(raw_price)
             if ts is None or price is None or price <= 0:
                 continue

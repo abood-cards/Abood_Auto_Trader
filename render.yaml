@@ -16,3 +16,15 @@ services:
         sync: false
       - key: DB_NAME
         value: abood_chess_db
+      - key: PO_SSID_DEMO
+        sync: false
+      - key: PO_WS_URL_DEMO
+        sync: false
+      - key: PO_UID_DEMO
+        sync: false
+      - key: PO_SSID_REAL
+        sync: false
+      - key: PO_WS_URL_REAL
+        sync: false
+      - key: PO_UID_REAL
+        sync: false

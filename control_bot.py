@@ -9,6 +9,7 @@ from cloud_settings import auth_frame, valid_number, valid_url
 from payout_guard import flag
 import config
 from worker import account_key
+from render_accounts import resolve_account, AccountConfigError
 
 
 class PrivateOwner(BaseMiddleware):
@@ -47,12 +48,16 @@ FIELDS = {'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً 
 
 def settings_text(d):
     t,r,k=d['trading'],d['recovery'],d['risk']
+    try:
+        _, source = resolve_account(d,d['account_mode'])
+    except AccountConfigError as exc:
+        source = str(exc)
     return (f"⚙️ M1 — {d['account_mode']}\nالأساس: ${t['trade_amount']:g} | المستويات: {t['martingale_steps']}\n"
             f"التعزيز: {'مفعّل' if r['mode']=='ENABLED' else 'معطّل'} | +${r['increment']:g}\n"
             f"الدخول المبكر للبيع: {'مفعّل' if d['chess']['early'] else 'معطّل'}\n"
             f"التدبيل الاستباقي للديمو: {'مفعّل' if d['chess']['early_double'] else 'معطّل'}\n"
             f"الحدود: {'مفعّلة' if k['mode']=='LIMITED' else 'معطّلة'} | +${k['profit_limit']:g} / −${k['loss_limit']:g}\n"
-            f"الجلسة: {'محفوظة' if d[account_key(d['account_mode'])]['ssid'] else 'غير مضافة'}")
+            f"مصدر الاتصال: {source}")
 
 
 def build_dispatcher(repo, worker, bot):
@@ -154,6 +159,13 @@ def build_dispatcher(repo, worker, bot):
         mode=data.get('mode','PRACTICE')
         raw=(msg.text or '').strip()
         try:
+            if key in ('ssid','url'):
+                import os
+                suffix = 'REAL' if mode == 'REAL' else 'DEMO'
+                if os.getenv(f'PO_SSID_{suffix}', '').strip():
+                    await msg.answer('هذا الحساب مُدار عبر Render؛ عدّل متغيراته هناك ثم أعد النشر.')
+                    await state.clear()
+                    return
             if key=='ssid':
                 if len(raw)>20000:
                     raise ValueError

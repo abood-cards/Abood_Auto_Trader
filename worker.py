@@ -6,8 +6,9 @@ import secrets
 import time
 from uuid import uuid4
 from chess_transport import ChessPocket
-from cloud_settings import auth_frame
+from render_accounts import resolve_account, AccountConfigError
 from risk_limits import risk_state
+from diagnostics import SafeIssue
 
 
 def account_key(mode):
@@ -61,14 +62,13 @@ class TradingWorker:
             doc = self.repo.doc
             try:
                 mode = doc['account_mode']
-                credentials = doc[account_key(mode)]
-                auth_frame(credentials['ssid'],mode,credentials.get('uid',0))
-            except ValueError:
-                return 'أدخل جلسة الحساب المختار من الإعدادات.'
+                _, source = resolve_account(doc,mode)
+            except AccountConfigError as exc:
+                return str(exc)
             self.stop_event.clear()
             self.stage = 'اتصال'
             self.task = asyncio.create_task(self.run())
-            return 'بدأ طلب الاتصال والمسح على M1.'
+            return 'بدأ طلب الاتصال والمسح على M1. مصدر الاتصال: '+source
 
     def valid(self, settings, deadline):
         d = self.repo.doc
@@ -213,7 +213,13 @@ class TradingWorker:
                     break
                 doc = deepcopy(self.repo.doc)
                 mode = doc['account_mode']
-                self.po = self.factory(doc[account_key(mode)],mode)
+                try:
+                    credentials, source = resolve_account(doc,mode)
+                except AccountConfigError as exc:
+                    self.stage = 'توقف: ' + str(exc)
+                    break
+                self.po = self.factory(credentials,mode)
+                print(f'[CHESS] settings_source={source} mode={mode}',flush=True)
                 probe = None
                 try:
                     await self.po.connect()
@@ -253,6 +259,10 @@ class TradingWorker:
                             with suppress(Exception):
                                 await asyncio.wait_for(self.notify(self.stage),5)
                         break
+                    if isinstance(exc, SafeIssue) and getattr(exc, 'code', None) == 'PO_AUTH_REJECTED':
+                        self.stage = 'توقف: المنصة رفضت المصادقة. راجع جلسة الحساب المختار في Render.'
+                        self.stop_event.set()
+                        break
                     self.stage = 'إعادة الاتصال'
                 finally:
                     if probe:
@@ -279,5 +289,14 @@ class TradingWorker:
         account = ('مطابق' if po.account_verified else 'لم يرد تأكيد مطابق') if po else '—'
         balance = ('وصل' if po.verified_balance is not None else 'لم يصل') if po else '—'
         subscriptions = po.subscription_requests if po else 0
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nطلبات الاشتراك: {subscriptions}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        try:
+            _, source = resolve_account(self.repo.doc,self.repo.doc['account_mode'])
+        except AccountConfigError as exc:
+            source = str(exc)
+        if po and po.connected:
+            market = 'تكات غير مستلمة' if not s.ticks_received else 'تكات وصلت؛ راجع عداد البث الحديث'
+            diag = f'\nالمصادقة: {int(po.auth_seen)} | إطارات الرصيد: {po.balance_events} | {market}'
+        else:
+            diag = ''
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))
