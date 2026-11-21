@@ -199,6 +199,7 @@ class ChessPocket(CloudPocket):
                 self.verified_balance_at = time.monotonic()
         if kind not in BALANCE_EVENTS and isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
             return
+        self.payout_book.feed(event)
         self.scanner.feed(event)
         if not self.wrong_mode:
             for tracked in self.trackers:

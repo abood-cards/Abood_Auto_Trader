@@ -9,6 +9,7 @@ from chess_transport import ChessPocket
 from render_accounts import resolve_account, AccountConfigError
 from risk_limits import risk_state
 from diagnostics import SafeIssue
+from payout_guard import scan_payout
 
 
 def account_key(mode):
@@ -27,6 +28,9 @@ class TradingWorker:
         self.lock = asyncio.Lock()
         self.focus = None
         self.preview = '—'
+        self.scan_target = None
+        self.probed = set()
+        self.last_signal = '—'
 
     @property
     def pending(self):
@@ -77,37 +81,49 @@ class TradingWorker:
                 and d[account_key(d['account_mode'])]==settings[account_key(d['account_mode'])]
                 and d['trading']==settings['trading'] and d['recovery']==settings['recovery']
                 and d['chess']==settings['chess']
+                and d['payout']==settings['payout']
                 and not risk_state(d)['reason'])
 
+    def payout(self, asset):
+        book = getattr(self.po,'payout_book',None)
+        return scan_payout(book,asset,self.repo.doc['payout']['max_age_seconds'])
+
     async def probe(self):
-        """Probe catalog symbols over the same socket. Actual ticks prove coverage."""
+        """Equal rotation when only one feed is available; concurrent streams are all scanned."""
         scanner = self.po.scanner
         checked = {}
-        candidate = None
-        probe_at = 0.0
+        self.probed.clear()
+        self.scan_target = None
+        target = None
+        probe_at = time.monotonic()
         while self.po.connected and not self.stop_event.is_set():
             now = time.monotonic()
             if not self.focus and not scanner.entries and not self.po.wrong_mode and now >= probe_at:
-                latest = scanner.series.get(candidate)
-                # If changeSymbol replaces the stream, retain a live symbol long
-                # enough for four complete candles before rotating again.
-                fresh = scanner.active_count()
-                _, _, forming = scanner.forming()
-                if (forming is not None and forming == candidate) or (latest and latest.bar and time.time()-latest.bar.last <= 5 and fresh < 2 and now-checked.get(candidate,0) < 310 and scanner.discard != candidate):
-                    probe_at = now+3
+                sources = {**{a:q.tradable is not False for a,q in self.po.payout_book.quotes.items()},
+                           **scanner.catalog}
+                candidates = sorted(a for a,on in sources.items() if on and a != scanner.discard)
+                live = set(scanner.active_assets())
+                single = target in live and len(live) == 1
+                testing_parallel = len(checked) == 1 and any(a not in checked for a in candidates)
+                in_range_or_unknown = target is not None and self.payout(target)[0] not in ('CLOSED','OUT_OF_RANGE','DURATION')
+                warmup = single and target in candidates and not testing_parallel and in_range_or_unknown
+                # A stale cache may still refresh; a current incompatible quote need not hold the slot.
+                window = scanner.forming({a for a in live if self.payout(a)[0]=='KNOWN'})[2]
+                # A continuously streaming asset gets time to close five full M1 bars,
+                # then yields its slot. A forming candle waits only until this boundary.
+                if window or (warmup and now-checked[target] < 370):
+                    probe_at = now+1
                 else:
-                    candidates = [a for a, enabled in scanner.catalog.items() if enabled and a != scanner.discard]
-                    preferred = self.repo.doc['trading']['asset']
-                    if not checked and preferred != scanner.discard and scanner.catalog.get(preferred, True):
-                        candidate = preferred
-                    else:
-                        candidate = min(candidates, key=lambda a:checked.get(a,0), default=None)
-                    if candidate:
-                        checked[candidate] = now
+                    choices = [a for a in candidates if a not in live]
+                    asset = min(choices,key=lambda a:(checked.get(a,float('-inf')),a),default=None)
+                    if asset is not None:
+                        checked[asset] = now
+                        self.probed.add(asset)
+                        target = self.scan_target = asset
                         async with asyncio.timeout(4):
-                            await self.po.subscribe(candidate)
-                    probe_at = now+12
-            await asyncio.sleep(1)
+                            await self.po.subscribe(asset)
+                    probe_at = now+10
+            await asyncio.sleep(.25)
 
     async def chain(self, entry, settings):
         self.focus = entry.asset
@@ -132,7 +148,8 @@ class TradingWorker:
                 return latest.bar.close
             return None
         def valid(deadline):
-            return self.valid(settings,deadline) and scanner.catalog.get(entry.asset,True) and fresh(3) is not None
+            return (self.valid(settings,deadline) and scanner.catalog.get(entry.asset,True)
+                    and fresh(3) is not None and self.payout(entry.asset)[0] == 'KNOWN')
         def adverse(price):
             mark = fresh(2)
             if price is None or mark is None:
@@ -247,7 +264,12 @@ class TradingWorker:
                             probe.result()
                         if scanner.entries:
                             entry = scanner.entries.popleft()
-                            if entry.expires_at > time.time() and entry.asset != scanner.discard:
+                            code, rate = self.payout(entry.asset)
+                            shown = f'{rate:g}%' if rate is not None else '—'
+                            if entry.expires_at <= time.time():
+                                code = 'ENTRY_EXPIRED'
+                            self.last_signal = f'{entry.asset} {entry.direction} | {shown} | {code}'
+                            if code == 'KNOWN' and entry.asset != scanner.discard:
                                 scanner.enabled = False
                                 scanner.entries.clear()
                                 await self.chain(entry,deepcopy(self.repo.doc))
@@ -291,15 +313,18 @@ class TradingWorker:
         focus = self.focus or '—'
         live = s.active_assets() if s else []
         receiving = ', '.join(live[:4]) + (f' (+{len(live)-4})' if len(live) > 4 else '') if live else '—'
-        preferred = self.repo.doc['trading']['asset']
-        watched = preferred if preferred in live else live[0] if live else None
+        count, _, forming = s.forming() if s else (0,0,None)
+        watched = forming or (self.scan_target if self.scan_target in live else live[0] if live else None)
         series = s.series.get(watched) if watched else None
         colors = {1:'🟢', -1:'🔴', 0:'⚪'}
-        candles = ' '.join(colors[b.color] if b.good else '▫️' for b in list(series.closed)[-3:]) if series else ''
+        candles = ' '.join(colors[b.color] if b.good else '▫️' for b in list(series.closed)[-4:]) if series else ''
         if series and series.bar:
             candles = f'{candles or "—"} | الحالية: {colors[series.bar.color]}'
-        count, _, forming = s.forming() if s else (0,0,None)
-        formation = f'{forming} ({count}/4)' if forming else '—'
+        formation = f'{forming} ({count}/5، آخر 10 ثوانٍ)' if forming else '—'
+        quotes = po.payout_book.quotes if po else {}
+        eligible = sum(self.payout(asset)[0]=='KNOWN' for asset in quotes)
+        code, rate = self.payout(watched) if watched else ('—',None)
+        rate_text = f'{rate:g}% ({code})' if rate is not None else code
         account = ('مطابق' if po.account_verified else 'لم يرد تأكيد مطابق') if po else '—'
         balance = ('وصل' if po.verified_balance is not None else 'لم يصل') if po else '—'
         subscriptions = po.subscription_requests if po else 0
@@ -317,5 +342,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nأولوية المسح: {preferred} | بث مستلم: {receiving}\nآخر 3 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(quotes)}\nآخر نموذج مغلق: {self.last_signal}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))

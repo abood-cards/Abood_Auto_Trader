@@ -2,16 +2,10 @@
 from collections import deque
 from dataclasses import dataclass
 import math
-import re
 import time
 from tick_clock import TickClock
 from collections import Counter
-
-
-def otc(value):
-    if not isinstance(value, str):
-        return None
-    return value if re.fullmatch(r'[A-Za-z0-9#._-]{1,40}_otc', value, re.I) else None
+from payout_guard import symbol as asset_symbol
 
 
 def num(value):
@@ -28,15 +22,17 @@ def extract_ticks(data, depth=0):
     if depth > 12:
         return
     if isinstance(data, list):
-        if len(data) >= 3 and otc(data[0]):
+        if len(data) >= 3 and asset_symbol(data[0]) and num(data[1]) is not None and num(data[2]) is not None:
             yield data[0], data[1], data[2]
         else:
             for entry in data:
                 yield from extract_ticks(entry, depth + 1)
     elif isinstance(data, dict):
-        symbol = otc(data.get('asset', data.get('symbol')))
+        symbol = asset_symbol(data.get('asset', data.get('symbol')))
         if symbol:
-            yield symbol, data.get('timestamp', data.get('time')), data.get('price', data.get('value'))
+            ts, price = data.get('timestamp', data.get('time')), data.get('price', data.get('value'))
+            if num(ts) is not None and num(price) is not None:
+                yield symbol, ts, price
         for key in ('data', 'ticks'):
             if key in data:
                 yield from extract_ticks(data[key], depth + 1)
@@ -46,20 +42,20 @@ def extract_catalog(value, depth=0):
     if depth > 10:
         return
     if isinstance(value, list):
-        if len(value) >= 6 and otc(value[1]):
+        if len(value) >= 6 and asset_symbol(value[1]):
             yield value[1], value[14] if len(value) > 14 else None
         else:
             for row in value:
                 yield from extract_catalog(row, depth+1)
     elif isinstance(value, dict):
-        symbol = otc(value.get('asset', value.get('symbol')))
+        symbol = asset_symbol(value.get('asset', value.get('symbol')))
         if symbol:
             yield symbol, next((value[k] for k in ('tradable','isActive','enabled') if k in value), None)
         for key, row in value.items():
-            if otc(key):
-                yield key, next((row[k] for k in ('tradable','isActive','enabled') if k in row), None) if isinstance(row,dict) else None
-            elif key in ('assets','data','result'):
+            if key in ('assets','data','result'):
                 yield from extract_catalog(row, depth+1)
+            elif asset_symbol(key) and isinstance(row,dict) and any(k in row for k in ('tradable','isActive','enabled','payout','profit','percent')):
+                yield key, next((row[k] for k in ('tradable','isActive','enabled') if k in row), None)
 
 
 @dataclass
@@ -96,22 +92,22 @@ class Series:
 
     @staticmethod
     def expected(bars):
-        """Last three consecutive, complete bars must alternate."""
-        bars = list(bars)[-3:]
-        if len(bars) != 3 or not all(b.good for b in bars):
+        """Four closed bars: tail of a same-colour run followed by alternation."""
+        bars = list(bars)[-4:]
+        if len(bars) != 4 or not all(b.good for b in bars):
             return 0
         if any(b.minute-a.minute != 60 for a,b in zip(bars,bars[1:])):
             return 0
-        a,b,c = (bar.color for bar in bars)
-        return -a if a and (b,c) == (-a,a) else 0
+        a,b,c,d = (bar.color for bar in bars)
+        return -a if a and (b,c,d) == (a,-a,a) else 0
 
     @classmethod
     def direction(cls, bars):
-        bars = list(bars)[-4:]
-        if len(bars) != 4:
+        bars = list(bars)[-5:]
+        if len(bars) != 5:
             return None
         last = bars[-1]
-        expected = cls.expected(bars[:3])
+        expected = cls.expected(bars[:4])
         if expected and last.good and last.minute == bars[-2].minute + 60 and last.color == expected:
             return 'BUY' if expected == -1 else 'SELL'
         return None
@@ -201,17 +197,20 @@ class Scanner:
                 if direction:
                     self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
 
-    def forming(self):
+    def forming(self, assets=None):
         """Track a candidate without assuming the open candle's final color."""
         now = self.clock()
         candidates = []
         for asset, series in self.series.items():
             bar = series.bar
-            if asset == self.discard or not self.catalog.get(asset, True) or not bar or now-bar.last > 10:
+            if (assets is not None and asset not in assets) or asset == self.discard or not self.catalog.get(asset, True) or not bar or now-bar.last > 10:
                 continue
             closed = series.closed
-            if closed and closed[-1].minute+60 == bar.minute and series.expected(closed):
-                candidates.append((3,bar.last,asset))
+            remaining = bar.minute + 60 - now
+            expected = series.expected(closed)
+            if (0 < remaining <= 10 and closed and closed[-1].minute+60 == bar.minute
+                    and expected and bar.color == expected):
+                candidates.append((4,bar.last,asset))
         return max(candidates, default=(0,0,None))
 
     def active_assets(self):

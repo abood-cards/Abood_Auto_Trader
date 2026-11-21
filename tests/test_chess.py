@@ -8,6 +8,7 @@ from chess_market import Scanner, Entry
 from chess_transport import ChessPocket, OrderResult, Decoder
 from cloud_settings import defaults, validate_document, patched
 from worker import TradingWorker
+from payout_guard import PayoutBook
 
 
 class MarketTests(unittest.TestCase):
@@ -27,34 +28,34 @@ class MarketTests(unittest.TestCase):
                 tick(t+sec,100 if sec<55 else 100+c)
         return s, tick, 6000+60*len(colors)
 
-    def test_sell_four(self):
-        s,t,end=self.setup_bars([-1,1,-1,1]); self.assertFalse(s.entries)
+    def test_sell_five(self):
+        s,t,end=self.setup_bars([-1,-1,1,-1,1]); self.assertFalse(s.entries)
         t(end+.2,100); self.assertEqual(s.entries.popleft().direction,'SELL')
-        self.assertEqual(len(s.catalog),2)
+        self.assertEqual(len(s.catalog),3)
 
-    def test_buy_close_regardless_of_preceding_green(self):
-        for pattern in ([1,-1,1,-1], [1,1,-1,1,-1]):
+    def test_buy_close_requires_repeated_green(self):
+        for pattern in ([1,1,-1,1,-1], [1,1,1,-1,1,-1]):
             with self.subTest(pattern=pattern):
                 s,t,end=self.setup_bars(pattern)
                 self.assertFalse(s.entries)
-                self.assertEqual(s.forming()[::2],(3,'AUDCAD_otc'))
+                self.assertEqual(s.forming()[::2],(4,'AUDCAD_otc'))
                 t(end+.2,100); t(end+.2,999); t(end+.5,101)
                 self.assertEqual(len(s.entries),1)
                 e=s.entries.popleft()
                 self.assertEqual((e.asset,e.direction,e.boundary,e.early),('AUDCAD_otc','BUY',end,False))
 
     def test_open_red_reverses_before_close(self):
-        s,t,end=self.setup_bars([1,-1,1,-1]); t(end-.2,101); t(end+.2,100)
+        s,t,end=self.setup_bars([1,1,-1,1,-1]); t(end-.2,101); t(end+.2,100)
         self.assertFalse(s.entries)
 
     def test_break_doji_gaps(self):
-        for colors,gap in [([1,-1,-1,1],False),([-1,1,0,1],False),([-1,1,-1,1],True),([1,-1,1],False)]:
+        for colors,gap in [([1,1,-1,-1,1],False),([-1,-1,1,0,1],False),([-1,-1,1,-1,1],True),([1,-1,1,-1],False)]:
             s,t,end=self.setup_bars(colors,gap=gap); t(end+.2,100)
             self.assertFalse(s.entries)
 
     def test_missing_minute_or_late_boundary(self):
         for seconds in (4,60.2):
-            s,t,end=self.setup_bars([1,-1,1,-1]); t(end+seconds,100)
+            s,t,end=self.setup_bars([1,1,-1,1,-1]); t(end+seconds,100)
             self.assertFalse(s.entries)
 
     def test_stale_future_duplicates_and_ms(self):
@@ -65,8 +66,9 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(s.active_count(),1)
 
     def test_partial_pattern(self):
-        s,t,end=self.setup_bars([-1,-1,1,-1]); t(end+.2,100)
-        self.assertEqual(s.forming()[::2],(3,'AUDCAD_otc'))
+        s,t,end=self.setup_bars([-1,-1,1,-1]); t(end+.2,100); t(end+45,101)
+        self.assertFalse(s.forming()[2]); t(end+50,101)
+        self.assertEqual(s.forming()[::2],(4,'AUDCAD_otc')); self.assertFalse(s.entries)
 
     def test_binary_and_unnamed(self):
         d=Decoder(); raw=b'[["EURUSD_otc",1700000000,1.1]]'
@@ -118,11 +120,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             item=next(queued)
             if item is None: raise TimeoutError
             return item
-        w.po=SimpleNamespace(scanner=s,balance=1000,send_order=AsyncMock(return_value=True),settlement=settle)
+        book=PayoutBook(d['account_mode'])
+        book.feed(['updateAssets',[{'symbol':asset,'payout':91,'tradable':True} for asset in ('USDINR_otc','AUDCAD_otc')]])
+        w.po=SimpleNamespace(scanner=s,balance=1000,send_order=AsyncMock(return_value=True),settlement=settle,payout_book=book)
         return w,Entry('USDINR_otc','SELL',int(now),now+3,False)
 
     async def test_audcad_pattern_dispatches_one_buy(self):
-        scanner,tick,end = MarketTests().setup_bars([1,-1,1,-1])
+        scanner,tick,end = MarketTests().setup_bars([1,1,-1,1,-1])
         self.assertFalse(scanner.entries)
         tick(end+.2,100)
         w,_ = self.mock_worker([('win',.9)])
@@ -133,12 +137,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         order = w.po.send_order.await_args.args[0]
         self.assertEqual((order['asset'],order['action'],order['amount']),('AUDCAD_otc','call',1))
         self.assertFalse(scanner.entries)
-
-    async def test_audcad_priority_accepts_chart_name(self):
-        from control_bot import preferred_asset
-        asset=preferred_asset('AUD/CAD OTC')
-        self.assertEqual(asset,'AUDCAD_otc')
-        self.assertEqual(patched(defaults(),{'trading.asset':asset})['trading']['asset'],asset)
 
     async def test_regular_ladder_then_one_enhancement(self):
         w,e=self.mock_worker([('loss',-1),('loss',-2),('loss',-4),('loss',-8),('loss',-2)])

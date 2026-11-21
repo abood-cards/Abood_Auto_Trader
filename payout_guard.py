@@ -29,9 +29,22 @@ def validate_payout(p):
 
 
 def symbol(value):
-    text=str(value or '').upper().replace('(OTC)','_OTC').replace(' OTC','_OTC')
-    text=re.sub(r'[\s/]','',text)
-    return text[:-4]+'_otc' if re.fullmatch(r'[A-Z]{6}_OTC',text) else None
+    # Use the wire identifier, not a display label. Include non-OTC assets and
+    # punctuation used for stocks, indices, commodities and crypto.
+    if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9#$][A-Za-z0-9#$.^:/_-]{0,63}',value):
+        return None
+    return value
+
+
+SCAN_PAYOUT_MIN = 90.0
+SCAN_PAYOUT_MAX = 92.0
+
+
+def scan_payout(book, asset, max_age):
+    code, rate, _ = quote_detail(book,asset,60,max_age)
+    if code == 'KNOWN' and not SCAN_PAYOUT_MIN <= rate <= SCAN_PAYOUT_MAX:
+        return 'OUT_OF_RANGE', rate
+    return code, rate
 
 
 def percent(value):
@@ -100,7 +113,7 @@ class PayoutBook:
                 sym=symbol(item[1]); raw=item[5]
                 active=flag(item[14]) if len(item)>14 else None
                 if len(item)>15 and isinstance(item[15],list):
-                    times=[r.get('time') for r in item[15] if isinstance(r,dict) and isinstance(r.get('time'),(int,float))]
+                    times=[r.get('time') for r in item[15] if isinstance(r,dict) and isinstance(r.get('time'),(int,float)) and 0 < r['time'] <= 86400]
                     hints=set(int(x) for x in times) or None
             elif isinstance(item,dict):
                 if 'isDemo' in item and flag(item['isDemo']) != (self.mode=='PRACTICE'): continue
@@ -111,7 +124,7 @@ class PayoutBook:
                 explicit=item.get('supported_durations',item.get('durations'))
                 if isinstance(explicit,list):
                     vals=[x.get('time') if isinstance(x,dict) else x for x in explicit]
-                    durations={int(x) for x in vals if isinstance(x,(int,float))} or None
+                    durations={int(x) for x in vals if isinstance(x,(int,float)) and not isinstance(x,bool) and 0 < x <= 86400} or None
             else: continue
             if not sym: continue
             rates={}
