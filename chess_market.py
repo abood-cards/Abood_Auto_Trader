@@ -5,6 +5,7 @@ import math
 import time
 from tick_clock import TickClock
 from collections import Counter
+from scan_scope import category
 from payout_guard import symbol as asset_symbol
 
 
@@ -43,19 +44,19 @@ def extract_catalog(value, depth=0):
         return
     if isinstance(value, list):
         if len(value) >= 6 and asset_symbol(value[1]):
-            yield value[1], value[14] if len(value) > 14 else None
+            yield value[1], value[14] if len(value) > 14 else None, value[3] if isinstance(value[3],str) else None
         else:
             for row in value:
                 yield from extract_catalog(row, depth+1)
     elif isinstance(value, dict):
         symbol = asset_symbol(value.get('asset', value.get('symbol')))
         if symbol:
-            yield symbol, next((value[k] for k in ('tradable','isActive','enabled') if k in value), None)
+            yield symbol, next((value[k] for k in ('tradable','isActive','enabled') if k in value), None), next((value[k] for k in ('category','assetType','type','group') if isinstance(value.get(k),str)),None)
         for key, row in value.items():
             if key in ('assets','data','result'):
                 yield from extract_catalog(row, depth+1)
             elif asset_symbol(key) and isinstance(row,dict) and any(k in row for k in ('tradable','isActive','enabled','payout','profit','percent')):
-                yield key, next((row[k] for k in ('tradable','isActive','enabled') if k in row), None)
+                yield key, next((row[k] for k in ('tradable','isActive','enabled') if k in row), None), next((row[k] for k in ('category','assetType','type','group') if isinstance(row.get(k),str)),None)
 
 
 @dataclass
@@ -140,6 +141,13 @@ class Scanner:
         self.last_clock = None
         self.series = {}
         self.catalog = {}
+        self.groups = {}
+        self.allowed = lambda asset: True
+        self.eligible = None  # production supplies the account payout gate
+        self.on_select = lambda asset: None
+        self.locked = None
+        self.last_wait = '—'
+        self.last_candidate = None
         self.verified = set()
         self.entries = deque(maxlen=128)
         self.enabled = False
@@ -148,6 +156,7 @@ class Scanner:
 
     def clear(self):
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
+        self.groups.clear(); self.locked = None; self.last_candidate = None; self.last_wait = '—'
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def feed(self, event):
@@ -155,9 +164,13 @@ class Scanner:
             return
         name,data = event[:2]
         if name in ('updateAssets','assets','listAssets','updateAsset'):
-            for asset, enabled in extract_catalog(data):
+            for asset, enabled, hint in extract_catalog(data):
                 if len(self.catalog) < 4096 or asset in self.catalog:
                     self.catalog[asset] = str(enabled).lower() not in ('0','false','0.0')
+                    if hint or asset not in self.groups:
+                        guessed = category(asset,hint)
+                        if guessed != 'other' or asset not in self.groups:
+                            self.groups[asset] = guessed
         if not isinstance(name,str) or name.lower() != 'updatestream':
             return
         now, mono = self.clock(), self.mono()
@@ -168,6 +181,8 @@ class Scanner:
                 continue
             if ts > 1e11:
                 ts /= 1000
+            if not self.allowed(asset):
+                continue
             if not self.catalog.get(asset, True):
                 self.rejected['ASSET_DISABLED'] += 1
                 continue
@@ -192,10 +207,40 @@ class Scanner:
             bar = series.bar
             if not self.enabled or self.discard == asset:
                 continue
+            if self.eligible is not None:
+                self.expire_focus(now)
+                if self.locked:
+                    held,boundary = self.locked
+                    if asset == held and rolled and bar.minute >= boundary:
+                        direction = series.direction(series.closed) if bar.minute == boundary else None
+                        if direction and now < boundary+3 and self.eligible(asset):
+                            self.entries.append(Entry(asset,direction,boundary,boundary+3,False))
+                            self.last_wait = f'{asset}: تأكّد الإغلاق'
+                        else:
+                            self.last_wait = f'{asset}: تراجع اللون أو لم يتأكد العائد/الإغلاق'
+                        self.locked = None
+                    continue
+                if self.entries or self.last_candidate == (asset,bar.minute+60):
+                    continue
+                remaining = bar.minute+60-now
+                expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
+                if (0 < remaining <= 10 and expected and bar.color == expected and self.eligible(asset)
+                        and bar.first-bar.minute <= 3 and bar.gap <= 10):
+                    self.locked = self.last_candidate = (asset,bar.minute+60)
+                    self.last_wait = f'{asset}: انتظار الإغلاق'
+                    self.on_select(asset)
+                continue
             if rolled and now <= bar.minute+3:
                 direction = series.direction(series.closed)
                 if direction:
                     self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
+
+    def expire_focus(self, now=None):
+        if self.locked:
+            asset,boundary = self.locked
+            if not self.enabled or not self.allowed(asset) or not self.catalog.get(asset,True) or (self.clock() if now is None else now) >= boundary+3:
+                self.last_wait = f'{asset}: أُلغي الانتظار (تغيير النطاق أو غياب إغلاق صالح)'
+                self.locked = None
 
     def forming(self, assets=None):
         """Track a candidate without assuming the open candle's final color."""
@@ -215,7 +260,7 @@ class Scanner:
 
     def active_assets(self):
         now = self.clock()
-        return sorted(a for a,s in self.series.items() if s.bar is not None
+        return sorted(a for a,s in self.series.items() if self.allowed(a) and s.bar is not None
                       and now-s.bar.last <= 10 and self.catalog.get(a,True))
 
     def active_count(self):

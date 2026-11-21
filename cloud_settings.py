@@ -1,5 +1,6 @@
 """Validated settings/document model; secrets never included in public displays."""
 from copy import deepcopy
+import scan_scope
 import json
 import math
 import os
@@ -83,6 +84,7 @@ def defaults():
                         balance_settle_seconds=config.BALANCE_SETTLE_SECONDS,
                         loss_recheck_seconds=config.LOSS_RECHECK_SECONDS),
         'risk': risk_defaults(),
+        'scan': scan_scope.defaults(),
         'chess': {'early': False, 'early_double': False},
         'recovery': recovery_defaults(),
         'payout': payout_defaults(),
@@ -95,6 +97,7 @@ def defaults():
 
 
 def validate_document(doc):
+    scan_scope.validate(doc.get('scan',scan_scope.defaults()))
     if any(type(doc.get('chess', {}).get(k)) is not bool for k in ('early','early_double')):
         raise ValueError('invalid_chess_timing')
     if doc.get('account_mode') not in MODES:
@@ -123,7 +126,7 @@ def patched(doc, fields):
     d = deepcopy(doc)
     if 'trading.asset' in fields and fields['trading.asset'] not in STORED_ASSET_NAMES:
         raise ValueError('اختر زوجاً من الصفحات الخمس المطابقة لبوت الإشارات')
-    allowed = {'chess.early', 'chess.early_double', 'account_mode'} | {'schedule.' + k for k in cycle_defaults()} | {'payout.' + k for k in payout_defaults()} | {'recovery.' + k for k in recovery_defaults()} | {'risk.' + k for k in risk_defaults()} | {'trading.' + k for k in defaults()['trading']} | {
+    allowed = {'scan', 'chess.early', 'chess.early_double', 'account_mode'} | {'schedule.' + k for k in cycle_defaults()} | {'payout.' + k for k in payout_defaults()} | {'recovery.' + k for k in recovery_defaults()} | {'risk.' + k for k in risk_defaults()} | {'trading.' + k for k in defaults()['trading']} | {
         f'{kind}_account.{key}' for kind in ('real', 'demo') for key in ('ssid', 'ws_url', 'uid')}
     for path, value in fields.items():
         if path not in allowed:

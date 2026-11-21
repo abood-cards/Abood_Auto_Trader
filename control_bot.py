@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from cloud_settings import auth_frame, valid_number, valid_url
 from payout_guard import flag
 import config
+import scan_scope
 from worker import account_key
 from render_accounts import resolve_account, AccountConfigError
 
@@ -34,13 +35,13 @@ def buttons(*rows):
 
 HOME = buttons((('▶️ بدء','start'),('⏹️ إيقاف','stop')),(('📡 الحالة','status'),('📊 الإحصائيات','stats')),(('⚙️ الإعدادات','settings'),))
 BACK = (('🏠 الرئيسية','home'),)
-SETTINGS = buttons((('👤 إدارة الحسابات','accounts'),),
+SETTINGS = buttons((('👤 إدارة الحسابات','accounts'),('🎯 نطاق المسح','scan')),
                    (('💵 الأساس','edit:amount'),('🪜 مستويات التدبيل','edit:steps')),
                    (('🛟 تشغيل/إيقاف التعزيز','boost'),('➕ زيادة التعزيز','edit:increment')),
                    (('⚡ تدبيل استباقي (ديمو فقط)','early_double'),),
                    (('🛡 تشغيل/إيقاف الحدود','limits'),),
                    (('حد الربح','edit:profit'),('حد الخسارة','edit:loss')),BACK)
-FIELDS = {'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً بمسافة ثم SSID الخام.', 'url':'أرسل رابط WebSocket للديمو.',
+FIELDS = {'scan_symbols':'أرسل رموز الأصول كما تظهر في الحالة مفصولة بفاصلة أو مسافة، مثل EURUSD_otc، BTCUSD، #AAPL_otc (حتى 40 أصلًا).','ssid':'أرسل إطار auth للديمو، أو UID متبوعاً بمسافة ثم SSID الخام.', 'url':'أرسل رابط WebSocket للديمو.',
           'amount':'أرسل مبلغ الأساس بالدولار (0.01–100000).', 'steps':'أرسل عدد المستويات من 0 إلى 4. القيمة 4 تعني أساس + 3 مضاعفات.',
           'increment':'أرسل الزيادة فوق الأساس بالدولار.', 'profit':'أرسل حد الربح بالدولار.', 'loss':'أرسل حد الخسارة بالدولار.'}
 
@@ -53,10 +54,24 @@ def settings_text(d):
         source = str(exc)
     return (f"⚙️ M1 — {d['account_mode']}\nالأساس: ${t['trade_amount']:g} | المستويات: {t['martingale_steps']}\n"
             f"التعزيز: {'مفعّل' if r['mode']=='ENABLED' else 'معطّل'} | +${r['increment']:g}\n"
-            "مسح تلقائي لجميع الأصول المرسلة | عائد 90–92% | الدخول بعد الإغلاق\n"
+            f"نطاق المسح: {scan_scope.describe(d.get('scan', scan_scope.defaults()))} | عائد 90–92%\n"
             f"التدبيل الاستباقي للديمو: {'مفعّل' if d['chess']['early_double'] else 'معطّل'}\n"
             f"الحدود: {'مفعّلة' if k['mode']=='LIMITED' else 'معطّلة'} | +${k['profit_limit']:g} / −${k['loss_limit']:g}\n"
             f"مصدر الاتصال: {source}")
+
+
+def scan_panel(d):
+    scope=d.get('scan',scan_scope.defaults())
+    groups=scope['groups'] if scope['mode']=='GROUPS' else []
+    choices=[(('✅ ' if key in groups else '')+name,'scan_group:'+key) for key,name in scan_scope.LABELS.items()]
+    rows=[tuple(choices[i:i+2]) for i in range(0,len(choices),2)]
+    rows += [((('✅ ' if scope['mode']=='ALL' else '')+'جميع الأصول','scan_all'),
+              (('✅ ' if scope['mode']=='CUSTOM' else '')+'قائمة مخصّصة','edit:scan_symbols')),
+             (('⬅️ الإعدادات','settings'),)]
+    text='🎯 نطاق المسح: '+scan_scope.describe(scope)+'\nاضغط على فئة لتفعيلها أو إلغائها. يمكنك الجمع بين أكثر من فئة.'
+    if scope['mode']=='CUSTOM':
+        text+='\n'+', '.join(scope['symbols'])
+    return text,buttons(*rows)
 
 
 def build_dispatcher(repo, worker, bot):
@@ -124,6 +139,24 @@ def build_dispatcher(repo, worker, bot):
                         raise ValueError
                     await repo.update({'account_mode':action.split(':')[1]})
                 await panel(cb,settings_text(repo.doc),SETTINGS)
+            elif action=='scan' or action=='scan_all' or action.startswith('scan_group:'):
+                if action != 'scan':
+                    async with worker.lock:
+                        scope=repo.doc.get('scan',scan_scope.defaults())
+                        if action=='scan_all':
+                            value=scan_scope.defaults()
+                        else:
+                            key=action.split(':',1)[1]
+                            if key not in scan_scope.LABELS:
+                                raise ValueError
+                            groups=set(scope['groups'] if scope['mode']=='GROUPS' else [])
+                            groups.symmetric_difference_update({key})
+                            if not groups:
+                                await panel(cb,'لا يمكن إلغاء آخر فئة. اختر فئة أخرى أولاً أو اختر جميع الأصول.',scan_panel(repo.doc)[1])
+                                return
+                            value={'mode':'GROUPS','groups':[g for g in scan_scope.LABELS if g in groups],'symbols':[]}
+                        await repo.update({'scan':value})
+                await panel(cb,*scan_panel(repo.doc))
             elif action=='settings':
                 await panel(cb,settings_text(repo.doc),SETTINGS)
             elif action=='early_double' and not repo.doc['chess']['early_double']:
@@ -185,6 +218,9 @@ def build_dispatcher(repo, worker, bot):
                     if (worker.task and not worker.task.done()) or worker.pending:
                         raise ValueError
                     await repo.update({account_key(mode)+'.ws_url':valid_url(raw)})
+            elif key=='scan_symbols':
+                async with worker.lock:
+                    await repo.update({'scan':{'mode':'CUSTOM','symbols':scan_scope.parse_symbols(raw),'groups':[]}})
             elif key=='steps':
                 await repo.update({'trading.martingale_steps':int(raw)})
             elif key in ('amount','increment','profit','loss'):
@@ -203,5 +239,9 @@ def build_dispatcher(repo, worker, bot):
                 with suppress(Exception):
                     await msg.delete()
         await state.clear()
-        await msg.answer(settings_text(repo.doc),reply_markup=SETTINGS)
+        if key=='scan_symbols':
+            text,kb=scan_panel(repo.doc)
+            await msg.answer(text,reply_markup=kb)
+        else:
+            await msg.answer(settings_text(repo.doc),reply_markup=SETTINGS)
     return dp
