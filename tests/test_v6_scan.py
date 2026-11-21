@@ -74,6 +74,8 @@ class WorkerScanTests(unittest.IsolatedAsyncioTestCase):
         async def advance(seconds):
             t[0]+=11
         w.po=SimpleNamespace(connected=True,wrong_mode=False,scanner=scanner,subscribe=subscribe,payout_book=PayoutBook('PRACTICE'))
+        w.po.payout_book.feed(['updateAssets',[{'asset':a,'payout':91} for a in ASSETS]])
+        for quote in w.po.payout_book.quotes.values(): quote.at=t[0]
         with patch('worker.time.monotonic',lambda: t[0]), patch('worker.asyncio.sleep',advance):
             await w.probe()
         self.assertEqual(seen,sorted(ASSETS))

@@ -144,6 +144,9 @@ class Scanner:
         self.groups = {}
         self.allowed = lambda asset: True
         self.eligible = None  # production supplies the account payout gate
+        self.track_price = lambda asset: True
+        self.payout_filtered = Counter()
+        self.last_second = False
         self.on_select = lambda asset: None
         self.locked = None
         self.last_wait = '—'
@@ -157,6 +160,7 @@ class Scanner:
     def clear(self):
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
         self.groups.clear(); self.locked = None; self.last_candidate = None; self.last_wait = '—'
+        self.payout_filtered.clear(); self.last_second = False
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def feed(self, event):
@@ -186,6 +190,10 @@ class Scanner:
             if not self.catalog.get(asset, True):
                 self.rejected['ASSET_DISABLED'] += 1
                 continue
+            self.expire_focus(now)
+            if not self.track_price(asset):
+                self.payout_filtered[asset] += 1
+                continue
             if asset not in self.clocks and len(self.clocks) >= 4096:
                 continue
             if asset not in self.clocks:
@@ -208,25 +216,27 @@ class Scanner:
             if not self.enabled or self.discard == asset:
                 continue
             if self.eligible is not None:
-                self.expire_focus(now)
                 if self.locked:
                     held,boundary = self.locked
+                    if asset == held and not self.last_second and 0 < boundary-now <= 1:
+                        self.last_second = True
                     if asset == held and rolled and bar.minute >= boundary:
                         direction = series.direction(series.closed) if bar.minute == boundary else None
                         if direction and now < boundary+3 and self.eligible(asset):
                             self.entries.append(Entry(asset,direction,boundary,boundary+3,False))
                             self.last_wait = f'{asset}: تأكّد الإغلاق'
                         else:
-                            self.last_wait = f'{asset}: تراجع اللون أو لم يتأكد العائد/الإغلاق'
+                            self.last_wait = f'{asset}: ' + ('أغلق بالنمط لكن العائد غير مؤهل' if direction else 'إغلاق معاكس أو شمعة غير مكتملة')
                         self.locked = None
                     continue
-                if self.entries or self.last_candidate == (asset,bar.minute+60):
+                if self.entries or self.last_candidate == (asset,bar.minute+60) or not self.eligible(asset):
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
-                if (0 < remaining <= 10 and expected and bar.color == expected and self.eligible(asset)
+                if (0 < remaining <= 60 and expected and bar.color == expected
                         and bar.first-bar.minute <= 3 and bar.gap <= 10):
                     self.locked = self.last_candidate = (asset,bar.minute+60)
+                    self.last_second = 0 < remaining <= 1
                     self.last_wait = f'{asset}: انتظار الإغلاق'
                     self.on_select(asset)
                 continue
@@ -253,7 +263,7 @@ class Scanner:
             closed = series.closed
             remaining = bar.minute + 60 - now
             expected = series.expected(closed)
-            if (0 < remaining <= 10 and closed and closed[-1].minute+60 == bar.minute
+            if (0 < remaining <= 60 and closed and closed[-1].minute+60 == bar.minute
                     and expected and bar.color == expected):
                 candidates.append((4,bar.last,asset))
         return max(candidates, default=(0,0,None))

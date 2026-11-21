@@ -87,6 +87,8 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             if len(starts)==2:
                 s.locked=None
         w.po=SimpleNamespace(connected=True,wrong_mode=False,scanner=s,subscribe=subscribe,payout_book=PayoutBook('PRACTICE'))
+        w.po.payout_book.feed(['updateAssets',[{'asset':a,'payout':91} for a in s.catalog]])
+        for quote in w.po.payout_book.quotes.values(): quote.at=t[0]
         with patch('worker.time.monotonic',lambda:t[0]),patch('worker.asyncio.sleep',sleep):
             await w.probe()
         self.assertEqual(starts[:2],[[],[]])
