@@ -45,6 +45,7 @@ class OrderResult:
         self.order = order
         self.deal = None
         self.candidate = None
+        self.entry_price = None
         self.future = asyncio.get_running_loop().create_future()
 
     def feed(self, name, payload, now):
@@ -64,8 +65,12 @@ class OrderResult:
             if row.get('error') or row.get('success') is False:
                 continue
             if name in self.OPEN:
-                if request_matches and deal is not None:
-                    self.deal = str(deal)
+                if request_matches:
+                    if deal is not None:
+                        self.deal = str(deal)
+                    price = num(row.get('openPrice',row.get('open_price',row.get('entryPrice'))))
+                    if price is not None and price > 0:
+                        self.entry_price = price
                 continue
             if not (request_matches or (deal is not None and self.deal == str(deal))):
                 continue
@@ -80,6 +85,10 @@ class OrderResult:
             if inferred is None or (label in ('win','loss','draw') and label != inferred):
                 continue
             self.candidate = (inferred,profit)
+            # Fast path: explicit matching result and signed net P/L. Without
+            # an explicit result, legacy profit ambiguity requires balance.
+            if label == inferred:
+                self.future.set_result(self.candidate)
             return
 
     def confirm_balance(self, balance, balance_at):
@@ -90,19 +99,25 @@ class OrderResult:
 
 
 class ChessPocket(CloudPocket):
+    decoder_class = Decoder
     def __init__(self, credentials, mode):
         super().__init__(credentials,mode)
         self.scanner = Scanner()
         self.result = None
-        self.demo_verified = False
+        self.trackers = []
+        self.account_verified = False
         self.wrong_mode = False
+        self.auth_seen = False
+        self.subscription_requests = 0
         self.verified_balance = None
         self.verified_balance_at = 0.0
 
     async def connect(self):
         self.scanner.clear()
-        self.demo_verified = self.wrong_mode = False
+        self.account_verified = self.wrong_mode = self.auth_seen = False
         self.result = None
+        self.trackers.clear()
+        self.subscription_requests = 0
         self.verified_balance = None
         self.verified_balance_at = 0.0
         await super().connect()
@@ -111,49 +126,70 @@ class ChessPocket(CloudPocket):
         if not isinstance(event,list) or len(event)<2 or not isinstance(event[0],str):
             return
         name,payload = event[:2]
-        if name in ('successauth','profile','updateBalance') and isinstance(payload,dict) and 'isDemo' in payload:
-            seen = flag(payload['isDemo'])
-            if seen is False:
-                self.wrong_mode = True
-                self.demo_verified = False
-            elif seen is True and not self.wrong_mode:
-                self.demo_verified = True
-        if isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not True:
+        expected = self.mode == 'PRACTICE'
+        kind = name.lower()
+        if kind == 'successauth':
+            self.auth_seen = True
+        account_event = kind in ('successauth','profile','updateprofile','updatebalance')
+        if account_event:
+            for row in records(payload):
+                if 'isDemo' not in row:
+                    continue
+                seen = flag(row['isDemo'])
+                if seen is expected:
+                    self.account_verified = not self.wrong_mode
+                    # A nested balance explicitly tagged with the selected mode.
+                    value = num(row.get('balance'))
+                    if value is not None and value >= 0 and self.account_verified:
+                        self.verified_balance = self.balance = value
+                        self.verified_balance_at = time.monotonic()
+                elif seen is not None and kind == 'successauth' and row is payload:
+                    self.wrong_mode = True
+                    self.account_verified = False
+        if isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
             return
         if name in ('successauth','profile','updateProfile','updateBalance'):
             super().process(event)
-            if isinstance(payload,dict) and self.demo_verified and not self.wrong_mode:
+            if isinstance(payload,dict) and self.account_verified and not self.wrong_mode:
                 value = num(payload.get('balance'))
                 if value is not None and value >= 0:
                     self.verified_balance = value
                     self.verified_balance_at = time.monotonic()
-            self.balance = self.verified_balance if self.demo_verified else self.balance
+            self.balance = self.verified_balance if self.account_verified else self.balance
         self.scanner.feed(event)
-        if self.result:
-            self.result.feed(name.lower(),payload,time.time())
-            if not self.wrong_mode:
-                self.result.confirm_balance(self.verified_balance,self.verified_balance_at)
+        if not self.wrong_mode:
+            for tracked in self.trackers:
+                tracked.feed(kind,payload,time.time())
+                if not tracked.order.get('overlap'):
+                    tracked.confirm_balance(self.verified_balance,self.verified_balance_at)
 
     async def subscribe(self, asset):
         if self.connected and not self.wrong_mode:
-            await self.select_asset(asset,60)
+            # Match the local collector subscription; M1 bars are built offline from ticks.
+            await self.select_asset(asset,5)
+            self.subscription_requests += 1
 
     async def send_order(self, order, valid):
         async with self._lock:
-            if not self.connected or self.wrong_mode or not self.demo_verified or self.mode != 'PRACTICE' or not valid():
+            if not self.connected or self.wrong_mode or not self.account_verified or order['mode'] != self.mode or not valid():
                 return False
             if self.verified_balance is None or self.verified_balance < order['amount']:
                 return False
             order.update(balance_before=self.verified_balance, sent_mono=time.monotonic(), sent_at=time.time())
             self.result = OrderResult(order)
+            self.trackers = [t for t in self.trackers if not t.future.done()][-1:]
+            if order.get('overlap'):
+                for t in self.trackers:
+                    t.order['overlap'] = True
+            self.trackers.append(self.result)
             fields = dict(asset=order['asset'], amount=order['amount'], action=order['action'],
-                          isDemo=1, optionType=100, time=60, requestId=order['requestId'])
+                          isDemo=int(self.mode=='PRACTICE'), optionType=100, time=60, requestId=order['requestId'])
             async with asyncio.timeout(3):
                 await self.ws.send('42'+json.dumps(['openOrder',fields],separators=(',',':')))
             return True
 
-    async def settlement(self):
-        future = self.result.future
+    async def settlement(self, tracked=None):
+        future = (tracked or self.result).future
         deadline = time.monotonic()+75
         while not future.done():
             if not self.connected or self.wrong_mode or time.monotonic() >= deadline:

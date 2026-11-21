@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from cloud_settings import auth_frame, valid_number, valid_url
 from payout_guard import flag
 import config
+from worker import account_key
 
 
 class PrivateOwner(BaseMiddleware):
@@ -32,10 +33,11 @@ def buttons(*rows):
 
 HOME = buttons((('▶️ بدء','start'),('⏹️ إيقاف','stop')),(('📡 الحالة','status'),('📊 الإحصائيات','stats')),(('⚙️ الإعدادات','settings'),))
 BACK = (('🏠 الرئيسية','home'),)
-SETTINGS = buttons((('🔑 جلسة الديمو','edit:ssid'),('🌐 رابط الديمو','edit:url')),
+SETTINGS = buttons((('👤 إدارة الحسابات','accounts'),),
                    (('💵 الأساس','edit:amount'),('🪜 مستويات التدبيل','edit:steps')),
                    (('🛟 تشغيل/إيقاف التعزيز','boost'),('➕ زيادة التعزيز','edit:increment')),
                    (('⏱ بيع آخر ثانية/بعد الإغلاق','early'),),
+                   (('⚡ تدبيل استباقي (ديمو فقط)','early_double'),),
                    (('🛡 تشغيل/إيقاف الحدود','limits'),),
                    (('حد الربح','edit:profit'),('حد الخسارة','edit:loss')),BACK)
 FIELDS = {'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً بمسافة ثم SSID الخام.', 'url':'أرسل رابط WebSocket للديمو.',
@@ -45,11 +47,12 @@ FIELDS = {'ssid':'أرسل إطار auth للديمو، أو UID متبوعاً 
 
 def settings_text(d):
     t,r,k=d['trading'],d['recovery'],d['risk']
-    return (f"⚙️ M1 — تجريبي فقط\nالأساس: ${t['trade_amount']:g} | المستويات: {t['martingale_steps']}\n"
+    return (f"⚙️ M1 — {d['account_mode']}\nالأساس: ${t['trade_amount']:g} | المستويات: {t['martingale_steps']}\n"
             f"التعزيز: {'مفعّل' if r['mode']=='ENABLED' else 'معطّل'} | +${r['increment']:g}\n"
             f"الدخول المبكر للبيع: {'مفعّل' if d['chess']['early'] else 'معطّل'}\n"
+            f"التدبيل الاستباقي للديمو: {'مفعّل' if d['chess']['early_double'] else 'معطّل'}\n"
             f"الحدود: {'مفعّلة' if k['mode']=='LIMITED' else 'معطّلة'} | +${k['profit_limit']:g} / −${k['loss_limit']:g}\n"
-            f"الجلسة: {'محفوظة' if d['demo_account']['ssid'] else 'غير مضافة'}")
+            f"الجلسة: {'محفوظة' if d[account_key(d['account_mode'])]['ssid'] else 'غير مضافة'}")
 
 
 def build_dispatcher(repo, worker, bot):
@@ -72,7 +75,7 @@ def build_dispatcher(repo, worker, bot):
     @dp.message(Command('cancel'))
     async def home(msg,state):
         await state.clear()
-        await msg.answer('♟ عبود أوتو تريدر | Abood Auto Trader\nM1 · حساب تجريبي',reply_markup=HOME)
+        await msg.answer('♟ عبود أوتو تريدر | Abood Auto Trader\nM1 · تجريبي / حقيقي',reply_markup=HOME)
 
     @dp.callback_query()
     async def callback(cb,state):
@@ -89,8 +92,9 @@ def build_dispatcher(repo, worker, bot):
             elif action=='stop':
                 await panel(cb,'مُنع فتح صفقات جديدة. تستمر مراقبة الصفقة المفتوحة حتى التسوية إن أمكن.')
             elif action=='stats':
-                s=repo.doc['account_stats']['PRACTICE']
-                await panel(cb,f"📊 ديمو\nالصفقات: {s['total_trades']} | ربح: {s['won_trades']} | خسارة: {s['lost_trades']} | تعادل: {s['draws']}\nسلاسل مستنفدة: {s['sequence_losses']}\nمبالغ الدخول: ${s['total_staked']:.2f} | العوائد: ${s['total_returned']:.2f}\nالصافي: ${s['net_pnl']:+.2f} | غير مؤكدة: {s['unconfirmed']}")
+                mode=repo.doc['account_mode']
+                s=repo.doc['account_stats'][mode]
+                await panel(cb,f"📊 {mode}\nالصفقات: {s['total_trades']} | ربح: {s['won_trades']} | خسارة: {s['lost_trades']} | تعادل: {s['draws']}\nسلاسل مستنفدة: {s['sequence_losses']}\nمبالغ الدخول: ${s['total_staked']:.2f} | العوائد: ${s['total_returned']:.2f}\nالصافي: ${s['net_pnl']:+.2f} | غير مؤكدة: {s['unconfirmed']}")
             elif action=='status':
                 kb=buttons((('مراجعة الأرشفة','archive'),),BACK) if worker.pending else HOME
                 await panel(cb,worker.status(),kb)
@@ -101,22 +105,43 @@ def build_dispatcher(repo, worker, bot):
                     await panel(cb,'انتظر انتهاء العامل أولاً.')
                 else:
                     await repo.acknowledge_pending()
-                    await panel(cb,'انتهت مراجعة الأمر المعلّق. لا يبدأ التداول تلقائياً.')
+                    await panel(cb,'تمت الأرشفة. إذا بقي أمر آخر فراجعه من الحالة. لا يبدأ التداول تلقائياً.')
+            elif action=='accounts':
+                await panel(cb, f"الحساب المختار: {repo.doc['account_mode']}", buttons(
+                    (('اختيار تجريبي','mode:PRACTICE'),('اختيار حقيقي','confirm_real')),
+                    (('جلسة الديمو','edit:ssid:PRACTICE'),('رابط الديمو','edit:url:PRACTICE')),
+                    (('جلسة الحقيقي','edit:ssid:REAL'),('رابط الحقيقي','edit:url:REAL')),
+                    (('⬅️ الإعدادات','settings'),)))
+            elif action=='confirm_real':
+                await panel(cb,'اختيار الحساب الحقيقي يتيح استخدام أموال حقيقية بعد الضغط على بدء.',buttons((('تأكيد الحساب الحقيقي','mode:REAL'),),BACK))
+            elif action in ('mode:PRACTICE','mode:REAL'):
+                async with worker.lock:
+                    if (worker.task and not worker.task.done()) or worker.pending:
+                        raise ValueError
+                    await repo.update({'account_mode':action.split(':')[1]})
+                await panel(cb,settings_text(repo.doc),SETTINGS)
             elif action=='settings':
                 await panel(cb,settings_text(repo.doc),SETTINGS)
-            elif action in ('boost','early','limits'):
+            elif action=='early_double' and not repo.doc['chess']['early_double']:
+                await panel(cb,'التدبيل الاستباقي تجريبي فقط: قد تفتح صفقتان وتتغير نتيجة الأولى قبل إغلاقها.', buttons((('تفعيل في الديمو','early_double:confirm'),),BACK))
+            elif action in ('boost','early','limits','early_double','early_double:confirm'):
                 d=repo.doc
                 changes={'boost':{'recovery.mode':'TRADITIONAL' if d['recovery']['mode']=='ENABLED' else 'ENABLED'},
+                         'early_double':{'chess.early_double':False},
+                         'early_double:confirm':{'chess.early_double':True},
                          'early':{'chess.early':not d['chess']['early']},
                          'limits':{'risk.mode':'TRADITIONAL' if d['risk']['mode']=='LIMITED' else 'LIMITED'}}
                 await repo.update(changes[action])
                 await panel(cb,settings_text(repo.doc),SETTINGS)
             elif action.startswith('edit:'):
-                key=action[5:]
-                if key in FIELDS:
+                parts=action[5:].split(':')
+                key=parts[0]
+                mode=parts[1] if len(parts)==2 else 'PRACTICE'
+                if key in FIELDS and mode in ('PRACTICE','REAL'):
                     await state.set_state(Input.value)
-                    await state.update_data(key=key)
-                    await panel(cb,FIELDS[key]+'\n/cancel للإلغاء',buttons((('⬅️ الإعدادات','settings'),)))
+                    await state.update_data(key=key, mode=mode)
+                    prompt = FIELDS[key].replace('للديمو', 'للحساب '+mode)
+                    await panel(cb,prompt+'\n/cancel للإلغاء',buttons((('⬅️ الإعدادات','settings'),)))
         except ValueError:
             await panel(cb,'الإعداد غير صالح أو خارج النطاق.',SETTINGS)
         except Exception as exc:
@@ -124,28 +149,32 @@ def build_dispatcher(repo, worker, bot):
 
     @dp.message(Input.value)
     async def update(msg,state):
-        key=(await state.get_data()).get('key')
+        data=await state.get_data()
+        key=data.get('key')
+        mode=data.get('mode','PRACTICE')
         raw=(msg.text or '').strip()
         try:
             if key=='ssid':
                 if len(raw)>20000:
                     raise ValueError
                 if raw.startswith('42['):
-                    if flag(json.loads(raw[2:])[1].get('isDemo')) is not True:
+                    if flag(json.loads(raw[2:])[1].get('isDemo')) is not (mode=='PRACTICE'):
                         raise ValueError
-                    frame=auth_frame(raw,'PRACTICE')
+                    frame=auth_frame(raw,mode)
                 else:
                     uid, ssid = raw.split(maxsplit=1)
                     if not uid.isascii() or not uid.isdecimal() or ssid.startswith('42'):
                         raise ValueError
-                    frame=auth_frame(ssid,'PRACTICE',int(uid))
-                if worker.task and not worker.task.done() or worker.pending:
-                    raise ValueError
-                await repo.update({'demo_account.ssid':frame})
+                    frame=auth_frame(ssid,mode,int(uid))
+                async with worker.lock:
+                    if (worker.task and not worker.task.done()) or worker.pending:
+                        raise ValueError
+                    await repo.update({account_key(mode)+'.ssid':frame})
             elif key=='url':
-                if worker.task and not worker.task.done() or worker.pending:
-                    raise ValueError
-                await repo.update({'demo_account.ws_url':valid_url(raw)})
+                async with worker.lock:
+                    if (worker.task and not worker.task.done()) or worker.pending:
+                        raise ValueError
+                    await repo.update({account_key(mode)+'.ws_url':valid_url(raw)})
             elif key=='steps':
                 await repo.update({'trading.martingale_steps':int(raw)})
             elif key in ('amount','increment','profit','loss'):

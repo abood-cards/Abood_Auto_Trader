@@ -136,6 +136,24 @@ class Repository:
                 raise RuntimeError('pending_or_lease_lost')
             self.doc['runtime']['pending'] = deepcopy(order)
 
+    async def reserve_followup(self, primary, followup):
+        async with self.lock:
+            q = self.fence()
+            q.update({'runtime.pending.id':primary['id'],'runtime.pending.followup':None})
+            result = await self.collection.update_one(q,{'$set':{'runtime.pending.followup':followup}})
+            if result.matched_count != 1:
+                raise RuntimeError('followup_reservation_failed')
+            self.doc['runtime']['pending']['followup'] = deepcopy(followup)
+
+    async def discard_followup(self, primary, followup):
+        async with self.lock:
+            q = self.fence()
+            q.update({'runtime.pending.id':primary['id'],'runtime.pending.followup.id':followup['id']})
+            result = await self.collection.update_one(q,{'$unset':{'runtime.pending.followup':''}})
+            if result.matched_count != 1:
+                raise RuntimeError('followup_discard_failed')
+            self.doc['runtime']['pending'].pop('followup',None)
+
     async def resolve(self, order, result, before, after, next_step, dispatched=True,
                       seq_lost=0, seq_lost_amount=0.0):
         """Idempotent by pending ID. Unknown finances are never counted as full loss."""
@@ -165,6 +183,8 @@ class Repository:
         if inc:
             update['$inc'] = inc
         async with self.lock:
+            followup = deepcopy((self.doc['runtime'].get('pending') or {}).get('followup'))
+            update['$set']['runtime.pending'] = followup
             previous = selected_state(self.doc, mode)
             current = previous
             if dispatched:
@@ -177,7 +197,7 @@ class Repository:
             r = await self.collection.update_one(q, update)
             if r.matched_count != 1:
                 raise RuntimeError('result_already_saved_or_lease_lost')
-            self.doc['runtime'].update(pending=None, martingale_step=effective_step,
+            self.doc['runtime'].update(pending=followup, martingale_step=effective_step,
                                        sizing_signature=order.get('sizing_signature'))
             self.doc['runtime'].setdefault('recovery', {})[mode] = current
             for path, v in inc.items():

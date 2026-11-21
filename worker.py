@@ -10,6 +10,10 @@ from cloud_settings import auth_frame
 from risk_limits import risk_state
 
 
+def account_key(mode):
+    return 'real_account' if mode == 'REAL' else 'demo_account'
+
+
 class TradingWorker:
     def __init__(self, repo, factory=ChessPocket):
         self.repo, self.factory = repo, factory
@@ -55,12 +59,12 @@ class TradingWorker:
             if not self.repo.leader:
                 return 'كاتب قاعدة البيانات غير متاح.'
             doc = self.repo.doc
-            if doc['account_mode'] != 'PRACTICE':
-                return 'هذا الإصدار مخصص للديمو.'
             try:
-                auth_frame(doc['demo_account']['ssid'], 'PRACTICE', doc['demo_account'].get('uid',0))
+                mode = doc['account_mode']
+                credentials = doc[account_key(mode)]
+                auth_frame(credentials['ssid'],mode,credentials.get('uid',0))
             except ValueError:
-                return 'أدخل إطار جلسة الديمو من الإعدادات.'
+                return 'أدخل جلسة الحساب المختار من الإعدادات.'
             self.stop_event.clear()
             self.stage = 'اتصال'
             self.task = asyncio.create_task(self.run())
@@ -69,7 +73,8 @@ class TradingWorker:
     def valid(self, settings, deadline):
         d = self.repo.doc
         return (self.repo.leader and not self.stop_event.is_set() and time.time() < deadline
-                and d['account_mode']=='PRACTICE' and d['demo_account']==settings['demo_account']
+                and d['account_mode']==settings['account_mode']
+                and d[account_key(d['account_mode'])]==settings[account_key(d['account_mode'])]
                 and d['trading']==settings['trading'] and d['recovery']==settings['recovery']
                 and d['chess']==settings['chess']
                 and not risk_state(d)['reason'])
@@ -82,7 +87,7 @@ class TradingWorker:
         probe_at = 0.0
         while self.po.connected and not self.stop_event.is_set():
             now = time.monotonic()
-            if not self.focus and self.po.demo_verified and now >= probe_at:
+            if not self.focus and not self.po.wrong_mode and now >= probe_at:
                 latest = scanner.series.get(candidate)
                 # If changeSymbol replaces the stream, retain a live symbol long
                 # enough for five complete candles before rotating again.
@@ -109,45 +114,71 @@ class TradingWorker:
         rec = settings['recovery']
         regular_losses = 0
         next_deadline = entry.expires_at
-        for step in range(levels + int(rec['mode']=='ENABLED')):
-            if not self.valid(settings,next_deadline) or not scanner.catalog.get(entry.asset, True):
-                break
-            series = scanner.series.get(entry.asset)
-            if not series or not series.bar or not -0.5 <= time.time()-series.bar.last <= 3:
-                break
-            enhanced = step == levels
-            amount = round(t['trade_amount'] + float(rec['increment']) if enhanced else t['trade_amount'] * 2**step,2)
-            if self.po.balance is None or amount > self.po.balance:
-                self.stage = 'الرصيد غير كافٍ'
-                self.stop_event.set()
-                break
-            order = dict(id=uuid4().hex, requestId=secrets.randbelow(2_000_000_000-1)+1,
-                         asset=entry.asset, mode='PRACTICE', amount=amount,
-                         action='call' if entry.direction=='BUY' else 'put', sent_at=time.time())
-            self.in_flight = True
-            await self.repo.reserve(order)
-            # Reservation may take time. Recheck expiry and permissions before wire send.
-            order['sent_at'] = time.time()
-            def can_send():
-                latest = scanner.series.get(entry.asset)
-                return (self.valid(settings,next_deadline) and scanner.catalog.get(entry.asset, True)
-                        and latest is not None and latest.bar is not None
-                        and -0.5 <= time.time()-latest.bar.last <= 3)
-            sent = await self.po.send_order(order,can_send)
-            if not sent:
-                await self.repo.resolve(order,None,None,None,0,dispatched=False)
-                self.in_flight = False
-                break
-            self.stage = f'صفقة {entry.direction} | {amount:g}$'
+        total = levels + int(rec['mode']=='ENABLED')
+        preopened = None
+        draining = False
+        def make_order(step):
+            amount = round(t['trade_amount'] + float(rec['increment']) if step == levels else t['trade_amount'] * 2**step,2)
+            return dict(id=uuid4().hex, requestId=secrets.randbelow(1_999_999_999)+1,
+                        asset=entry.asset, mode=settings['account_mode'], amount=amount,
+                        action='call' if entry.direction=='BUY' else 'put', sent_at=time.time())
+        def fresh(seconds):
+            latest = scanner.series.get(entry.asset)
+            if latest and latest.bar and -0.5 <= time.time()-latest.bar.last <= seconds:
+                return latest.bar.close
+            return None
+        def valid(deadline):
+            return self.valid(settings,deadline) and scanner.catalog.get(entry.asset,True) and fresh(3) is not None
+        def adverse(price):
+            mark = fresh(2)
+            if price is None or mark is None:
+                return False
+            return mark < price if entry.direction=='BUY' else mark > price
+        for step in range(total):
+            if preopened is None:
+                if not valid(next_deadline):
+                    break
+                order = make_order(step)
+                if self.po.balance is None or order['amount'] > self.po.balance:
+                    self.stage = 'توقف: الرصيد غير كافٍ'
+                    self.stop_event.set()
+                    break
+                self.in_flight = True
+                await self.repo.reserve(order)
+                order['sent_at'] = time.time()
+                if not await self.po.send_order(order,lambda:valid(next_deadline)):
+                    await self.repo.resolve(order,None,None,None,0,dispatched=False)
+                    self.in_flight = False
+                    break
+                tracked = getattr(self.po,'result',None)
+            else:
+                order, tracked = preopened
+                preopened = None
+            self.stage = f'صفقة {entry.direction} | {order["amount"]:g}$'
             self.preview = '—'
-            settle = asyncio.create_task(self.po.settlement())
+            expiry = order['sent_at']+60
+            settle = asyncio.create_task(self.po.settlement(tracked) if tracked else self.po.settlement())
             try:
-                done, _ = await asyncio.wait({settle}, timeout=max(0,order['sent_at']+59-time.time()))
+                done, _ = await asyncio.wait({settle}, timeout=max(0,expiry-2-time.time()))
                 if not done:
-                    b = scanner.series.get(entry.asset)
-                    if b and b.bar and 0 <= time.time()-b.bar.last <= 2:
-                        col = b.bar.color
-                        self.preview = 'لون معاكس (تقديري)' if col == (-1 if entry.direction=='BUY' else 1) else 'لا انعكاس مرصود'
+                    price = getattr(tracked,'entry_price',None)
+                    mark = fresh(2)
+                    if price is not None and mark is not None:
+                        self.preview = f'دخول {price:.10g} | آخر {mark:.10g} | ' + ('خاسرة لحظياً' if adverse(price) else 'غير خاسرة لحظياً')
+                    else:
+                        self.preview = 'سعر دخول مؤكد أو تكة حديثة غير متاحين'
+                    if (not draining and step+1 < total and settings['account_mode']=='PRACTICE'
+                        and settings['chess']['early_double'] and tracked and tracked.deal is not None
+                        and valid(expiry) and adverse(price)):
+                        followup = make_order(step+1)
+                        # Keep enough balance for both stakes even if debit of the first is delayed.
+                        if self.po.balance is not None and self.po.balance >= order['amount']+followup['amount']:
+                            followup['overlap'] = True
+                            await self.repo.reserve_followup(order,followup)
+                            if await self.po.send_order(followup,lambda:valid(expiry) and not tracked.future.done() and adverse(price)):
+                                preopened = (followup,self.po.result)
+                            else:
+                                await self.repo.discard_followup(order,followup)
                 result, net = await settle
             finally:
                 if not settle.done():
@@ -155,19 +186,21 @@ class TradingWorker:
                     with suppress(asyncio.CancelledError):
                         await settle
             confirmed_at = time.time()
-            if result == 'loss' and not enhanced:
+            if result == 'loss' and step < levels:
                 regular_losses += -net
-            exhausted = int(result=='loss' and step==levels-1)
+            exhausted = int(not draining and result=='loss' and step==levels-1)
             await self.repo.resolve(order,result,0,net,0,seq_lost=exhausted,
                                     seq_lost_amount=regular_losses if exhausted else 0)
-            self.in_flight = False
-            if result != 'loss' or enhanced:
-                break
-            if risk_state(self.repo.doc)['reason']:
+            self.in_flight = preopened is not None
+            limit = risk_state(self.repo.doc)['reason']
+            if limit:
                 self.stop_event.set()
                 self.stage = 'توقف: بلوغ حد مالي'
+            if result != 'loss' or limit or self.stop_event.is_set() or draining:
+                if preopened:
+                    draining = True  # settle already-sent exposure, but do not extend the ladder
+                    continue
                 break
-            # Never catch up a stale continuation after storage/network delay.
             next_deadline = min(confirmed_at+3,order['sent_at']+70)
 
     async def run(self):
@@ -179,7 +212,8 @@ class TradingWorker:
                     self.stage='توقف: بلوغ حد مالي'
                     break
                 doc = deepcopy(self.repo.doc)
-                self.po = self.factory(doc['demo_account'],'PRACTICE')
+                mode = doc['account_mode']
+                self.po = self.factory(doc[account_key(mode)],mode)
                 probe = None
                 try:
                     await self.po.connect()
@@ -188,17 +222,17 @@ class TradingWorker:
                     delay = 1
                     while self.po.connected and not self.stop_event.is_set():
                         if self.po.wrong_mode:
-                            self.stage = 'توقف: إشارة حساب غير تجريبي'
+                            self.stage = 'توقف: تأكيد المصادقة يخص حساباً مختلفاً'
                             self.stop_event.set()
                             break
                         if risk_state(self.repo.doc)['reason']:
                             self.stage = 'توقف: بلوغ حد مالي'
                             self.stop_event.set()
                             break
-                        scanner.enabled = bool(self.po.demo_verified)
+                        scanner.enabled = bool(self.po.account_verified and self.po.verified_balance is not None)
                         scanner.early = self.repo.doc['chess']['early']
                         scanner.discard = previous_asset if len([a for a,on in scanner.catalog.items() if on]) > 1 else None
-                        self.stage = 'مسح M1' if scanner.enabled else 'انتظار تأكيد الديمو'
+                        self.stage = 'مسح M1' if scanner.enabled else 'مسح للقراءة فقط — انتظار تأكيد نوع الحساب والرصيد'
                         if probe.done():
                             probe.result()
                         if scanner.entries:
@@ -242,5 +276,8 @@ class TradingWorker:
         focus = self.focus or '—'
         count, _, forming = s.forming() if s else (0,0,None)
         formation = f'{forming} ({count}/4)' if forming else '—'
-        return (f'{self.stage}\n{coverage}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانية: {self.preview}'
+        account = ('مطابق' if po.account_verified else 'لم يرد تأكيد مطابق') if po else '—'
+        balance = ('وصل' if po.verified_balance is not None else 'لم يصل') if po else '—'
+        subscriptions = po.subscription_requests if po else 0
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nطلبات الاشتراك: {subscriptions}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))

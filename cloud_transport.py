@@ -22,6 +22,7 @@ from wire_decoder import EventDecoder
 
 
 class CloudPocket(PocketOptionWS):
+    decoder_class = EventDecoder
     def __init__(self, credentials, mode):
         super().__init__(credentials['ssid'])
         self.url = credentials['ws_url']
@@ -29,7 +30,7 @@ class CloudPocket(PocketOptionWS):
         self.credentials = credentials.copy()
         self.payout_book = PayoutBook(mode)
         self.entry_check = None
-        self.decoder = EventDecoder()
+        self.decoder = self.decoder_class()
         self.balance_at = 0.0
         self.saw_other_account_balance = False
         self.server_uid = None
@@ -92,7 +93,7 @@ class CloudPocket(PocketOptionWS):
     async def connect(self):
         await self.close()
         self.payout_book.clear()
-        self.decoder = EventDecoder()
+        self.decoder = self.decoder_class()
         self.balance = None
         self.saw_other_account_balance = False
         self.server_uid = None

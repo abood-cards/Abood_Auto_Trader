@@ -67,7 +67,7 @@ class MarketTests(unittest.TestCase):
     def test_settings_scope(self):
         self.assertFalse(validate_document(defaults())['chess']['early'])
         self.assertTrue(patched(defaults(),{'chess.early':True})['chess']['early'])
-        with self.assertRaises(ValueError): patched(defaults(),{'account_mode':'REAL'})
+        self.assertEqual(patched(defaults(),{'account_mode':'REAL'})['account_mode'],'REAL')
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -95,7 +95,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         frames=[json.loads(call.args[0][2:]) for call in p.ws.send.await_args_list]
         self.assertEqual([x[0] for x in frames],['changeSymbol','openOrder'])
         self.assertEqual(frames[-1][1]['time'],60)
-        p.process(['updateBalance',{'isDemo':0,'balance':999}])
+        p.process(['successauth',{'isDemo':0,'balance':999}])
         self.assertFalse(await p.send_order(order,lambda:True))
 
     def mock_worker(self, outcomes, enhance=True):

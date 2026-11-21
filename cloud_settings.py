@@ -87,7 +87,7 @@ def defaults():
                         balance_settle_seconds=config.BALANCE_SETTLE_SECONDS,
                         loss_recheck_seconds=config.LOSS_RECHECK_SECONDS),
         'risk': risk_defaults(),
-        'chess': {'early': False},
+        'chess': {'early': False, 'early_double': False},
         'recovery': recovery_defaults(),
         'payout': payout_defaults(),
         'schedule': cycle_defaults(),
@@ -99,9 +99,9 @@ def defaults():
 
 
 def validate_document(doc):
-    if type(doc.get('chess', {}).get('early')) is not bool:
+    if any(type(doc.get('chess', {}).get(k)) is not bool for k in ('early','early_double')):
         raise ValueError('invalid_chess_timing')
-    if doc.get('account_mode') != 'PRACTICE':
+    if doc.get('account_mode') not in MODES:
         raise ValueError('نوع حساب غير صالح')
     validate_risk(doc.get('risk', risk_defaults()))
     validate_payout(doc.get('payout', payout_defaults()))
@@ -127,7 +127,7 @@ def patched(doc, fields):
     d = deepcopy(doc)
     if 'trading.asset' in fields and fields['trading.asset'] not in SYMBOL_NAMES:
         raise ValueError('اختر زوجاً من الصفحات الخمس المطابقة لبوت الإشارات')
-    allowed = {'chess.early'} | {'schedule.' + k for k in cycle_defaults()} | {'payout.' + k for k in payout_defaults()} | {'recovery.' + k for k in recovery_defaults()} | {'risk.' + k for k in risk_defaults()} | {'trading.' + k for k in defaults()['trading']} | {
+    allowed = {'chess.early', 'chess.early_double', 'account_mode'} | {'schedule.' + k for k in cycle_defaults()} | {'payout.' + k for k in payout_defaults()} | {'recovery.' + k for k in recovery_defaults()} | {'risk.' + k for k in risk_defaults()} | {'trading.' + k for k in defaults()['trading']} | {
         f'{kind}_account.{key}' for kind in ('real', 'demo') for key in ('ssid', 'ws_url', 'uid')}
     for path, value in fields.items():
         if path not in allowed:
