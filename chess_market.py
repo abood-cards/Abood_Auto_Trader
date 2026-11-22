@@ -168,6 +168,9 @@ class Scanner:
         self.allowed = lambda asset: True
         self.eligible = None  # production supplies the account payout gate
         self.strict_focus = False
+        self.history_only = False
+        self.history_checked = None
+        self.history_minute = None
         self.history_asset = None
         self.history_state = '—'
         self.history_rows = None
@@ -187,6 +190,7 @@ class Scanner:
         self.ticks_received = 0
 
     def clear(self):
+        self.history_checked = self.history_minute = None
         self.history_asset = self.history_rows = None
         self.history_state = '—'
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
@@ -196,6 +200,7 @@ class Scanner:
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def request_history(self, asset):
+        self.history_checked = self.history_minute = None
         self.history_asset = asset
         self.history_rows = None
         self.history_state = f'{asset}: طلب تاريخ M1'
@@ -208,7 +213,7 @@ class Scanner:
         if not asset or asset != self.history_asset or period != 60:
             return
         candles = payload.get('candles',payload.get('data'))
-        if not isinstance(candles,list) or not 4 <= len(candles) <= 5000:
+        if not isinstance(candles,list) or not 1 <= len(candles) <= 5000:
             return
         rows = {}
         for item in candles:
@@ -223,20 +228,29 @@ class Scanner:
                 continue
             if ts > 1e11:
                 ts /= 1000
-            if ts % 60:
+            # Accept explicit close-stamped candles only with an explicit convention.
+            if payload.get('timestampType') == 'close':
+                ts -= 60
+            if ts <= 0 or ts % 60:
                 continue
             if ts in rows and rows[ts] != (o,c):
                 self.history_state = f'{asset}: تاريخ متضارب'
                 return
             rows[ts] = (o,c)
-        self.history_rows = rows or None
+        if not rows:
+            self.history_state = f'{asset}: رد M1 بلا صفوف OHLC صالحة'
+            return
+        merged = dict(self.history_rows or {})
+        merged.update(rows)
+        self.history_rows = dict(sorted(merged.items())[-5000:])
         self.history_state = f'{asset}: وصل التاريخ؛ انتظار تكة حديثة لمطابقة الدقيقة'
 
     def seed_history(self, asset, series, ts, offset):
         if asset != self.history_asset or self.history_rows is None:
             return
         rows = self.history_rows
-        self.history_rows = None
+        if not self.history_only:
+            self.history_rows = None
         minute = int(ts//60)*60
         times = tuple(range(minute-240,minute,60))
         if self.locked or (series.bar and series.bar.minute > minute):
@@ -245,7 +259,7 @@ class Scanner:
         # At the boundary the previous live bar has not been rolled yet.
         if series.bar and series.bar.minute == minute-60 and series.bar.good:
             existing[series.bar.minute] = series.bar
-        live = {m for m in times if m in existing and existing[m].good}
+        live = set() if self.history_only else {m for m in times if m in existing and existing[m].good}
         shifts = tuple(dict.fromkeys((offset,0)))
         candidates = [(shift, {m for m in times if m+shift in rows}) for shift in shifts]
         # Both clocks are known, not guessed. Overlapping ambiguous snapshots
@@ -255,9 +269,12 @@ class Scanner:
         if len(viable)!=1:
             best=max((len(present | live) for _,present in candidates),default=0)
             why='توقيت تاريخ ملتبس' if viable else 'دقائق مغلقة غير متصلة'
-            self.history_state=f'{asset}: {why} ({best}/4 | صفوف {len(rows)})'
+            latest=min((int(minute-(max(rows)-shift)) for shift in shifts),key=abs)
+            self.history_state=f'{asset}: {why} ({best}/4 | صفوف {len(rows)} | فرق أحدث صف {latest:+d}ث)'
             return
         shift,present=viable[0]
+        self.history_rows = None
+        self.history_minute = minute
         if not series.bar or series.bar.minute != minute:
             series.bar = None
         for m in present-live:
@@ -364,10 +381,16 @@ class Scanner:
                         self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
                         self.last_wait = f'{asset}: تطابق عند الإغلاق'
                         continue
+                if self.history_only and (asset != self.history_asset or self.history_minute != bar.minute):
+                    continue
                 if self.last_candidate == (asset,bar.minute+60):
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
+                if self.history_only and 0 < remaining <= 60:
+                    self.history_checked = (asset,bar.minute)
+                    if not expected:
+                        self.history_state = f'{asset}: 4/4 — الألوان لا تطابق النموذج'
                 if 0 < remaining <= 60 and expected:
                     self.locked = self.last_candidate = (asset,bar.minute+60)
                     self.last_second = 0 < remaining <= 1

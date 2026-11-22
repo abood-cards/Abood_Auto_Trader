@@ -147,11 +147,6 @@ class TradingWorker:
         return sorted((a for a,on in sources.items() if on and self.allowed_asset(a)
                        and self.payout(a)[0]=='KNOWN'),key=self.scan_key)
 
-    def history_fallback(self, target, scanner):
-        # If the sole live stream has no usable history, retain it long enough
-        # to collect the four real candles rather than restarting every 15s.
-        return scanner.history_asset == target and scanner.active_count() == 1
-
     async def probe(self):
         """Equal rotation when only one feed is available; concurrent streams are all scanned."""
         scanner = self.po.scanner
@@ -191,13 +186,18 @@ class TradingWorker:
                 parallel = (requested_wall is not None and age >= VERIFY_PARALLEL_AFTER and
                     any(a != target and scanner.series[a].bar.last >= requested_wall+VERIFY_PARALLEL_AFTER
                         for a in live if a in candidates))
-                hold = (target in live and target in candidates and target != finished_target
-                        and depth < 4 and not parallel and age < (COLLECT_WINDOW if not scanner.history_asset or self.history_fallback(target, scanner) else 15))
+                history_mode = scanner.history_only and scanner.history_asset == target and target is not None
+                checked_history = bool(scanner.history_checked and scanner.history_checked[0] == target)
+                hold = (target in candidates and target != finished_target and (
+                    (history_mode and not checked_history and age < 12) or
+                    (not history_mode and target in live and depth < 4 and not parallel and age < COLLECT_WINDOW)))
                 if hold:
-                    self.scan_state = f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة'
+                    self.scan_state = (f'{target}: انتظار رد التاريخ (حتى 12ث)' if history_mode else f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة')
                     probe_at = now+.5
                 else:
-                    choices = [a for a in candidates if a not in live]
+                    choices = candidates if history_mode else [a for a in candidates if a not in live]
+                    if history_mode and choices == [target] and age < 12:
+                        choices = []
                     asset = next(iter(choices),None)
                     if asset is not None:
                         finished_target = None
@@ -209,7 +209,7 @@ class TradingWorker:
                             await self.po.subscribe(asset)
                     else:
                         self.scan_state = 'متابعة البث المتاح' if live else 'انتظار أصل بعائد مؤهل'
-                    probe_at = now+10
+                    probe_at = now+(.5 if scanner.history_only else 10)
             await asyncio.sleep(.25)
 
     async def chain(self, entry, settings):
@@ -345,7 +345,7 @@ class TradingWorker:
                         or (scanner.locked is not None and asset == scanner.locked[0])
                         or self.keep_warming(asset))
                     scanner.on_select = self.focus_selected
-                    scanner.strict_focus = mode == 'PRACTICE'
+                    scanner.strict_focus = scanner.history_only = mode == 'PRACTICE'
                     probe = asyncio.create_task(self.probe())
                     delay = 1
                     while self.po.connected and not self.stop_event.is_set():
@@ -424,12 +424,14 @@ class TradingWorker:
         receiving = ', '.join(live[:4]) + (f' (+{len(live)-4})' if len(live) > 4 else '') if live else '—'
         forming = s.locked[0] if s and s.locked else None
         scope = scan_scope.describe(self.repo.doc.get('scan',scan_scope.defaults()))
-        watched = forming or (self.scan_target if self.scan_target in live else live[0] if live else None)
+        watched = forming or self.scan_target or (live[0] if live else None)
         series = s.series.get(watched) if watched else None
         colors = {1:'🟢', -1:'🔴', 0:'⚪'}
-        candles = ' '.join(colors[b.color] if b.good else '▫️' for b in list(series.closed)[-4:]) if series else ''
-        if series and series.bar:
-            candles = f'{candles or "—"} | الحالية: {colors[series.bar.color]}'
+        minute = int(s.clock()//60)*60 if s else None
+        bar = series.bar if series and series.bar and series.bar.minute == minute else None
+        closed_colors = {b.minute:colors[b.color] for b in series.closed if b.good} if series else {}
+        candles = ' | '.join([f'1: {colors[bar.color] if bar else "—"} (مفتوحة)'] +
+                 [f'{i}: {closed_colors.get(minute-60*(i-1), "—") if minute is not None else "—"}' for i in range(2,6)])
         formation = f'{forming} — باقي {max(0,s.locked[1]-time.time()):.0f} ث' if forming else '—'
         quotes = po.payout_book.quotes if po else {}
         scoped_payouts = [self.payout(asset)[0] for asset in quotes if self.allowed_asset(asset)]
@@ -458,5 +460,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status} | صلاحية حتى {max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc["payout"]["max_age_seconds"]):g} ث\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}\nتاريخ M1: {s.history_state if s else chr(8212)}\nجدولة المسح: {('مثبّت حتى الإغلاق' if forming else self.scan_state)}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nشموع {watched or "—"} (الأحدث أولًا): {candles}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status} | صلاحية حتى {max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc["payout"]["max_age_seconds"]):g} ث\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}\nتاريخ M1: {s.history_state if s else chr(8212)}\nجدولة المسح: {('مثبّت حتى الإغلاق' if forming else self.scan_state)}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))
