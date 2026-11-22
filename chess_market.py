@@ -154,6 +154,7 @@ class Scanner:
         self.groups = {}
         self.allowed = lambda asset: True
         self.eligible = None  # production supplies the account payout gate
+        self.strict_focus = False
         self.track_price = lambda asset: True
         self.payout_filtered = Counter()
         self.last_second = False
@@ -248,10 +249,10 @@ class Scanner:
                 if rolled and bar.minute <= now < bar.minute+3 and self.last_candidate != (asset,bar.minute):
                     depth = series.ready_depth()
                     direction = series.direction(series.closed) if depth >= 5 else None
-                    code = 'MATCH' if direction else ('PATTERN' if depth >= 5 else 'WARMUP')
+                    code = ('NO_PRIOR_FOCUS' if self.strict_focus else 'MATCH') if direction else ('PATTERN' if depth >= 5 else 'WARMUP')
                     self.closed_checks[code] += 1
                     self.last_closed = f'{asset}: {depth}/5 | {code}'
-                    if direction:
+                    if direction and not self.strict_focus:
                         self.last_candidate = (asset,bar.minute)
                         self.on_select(asset)
                         self.entries.append(Entry(asset,direction,bar.minute,bar.minute+3,False))
@@ -261,8 +262,7 @@ class Scanner:
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
-                if (0 < remaining <= 60 and expected
-                        and bar.first-bar.minute <= 3 and bar.gap <= 10):
+                if 0 < remaining <= 60 and expected:
                     self.locked = self.last_candidate = (asset,bar.minute+60)
                     self.last_second = 0 < remaining <= 1
                     self.last_wait = f'{asset}: انتظار الإغلاق'
