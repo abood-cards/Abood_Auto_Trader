@@ -67,6 +67,7 @@ class Bar:
     opened: float
     close: float
     gap: float = 0
+    demo_tolerance: bool = False
 
     @property
     def color(self):
@@ -74,7 +75,18 @@ class Bar:
 
     @property
     def good(self):
-        return self.first - self.minute <= 3 and self.minute + 60 - self.last <= 3 and self.gap <= 10
+        return self.coverage_issue is None
+
+    @property
+    def coverage_issue(self):
+        edge, gap = (5, 20) if self.demo_tolerance else (3, 10)
+        if self.first - self.minute > edge:
+            return 'LATE_FIRST_TICK'
+        if self.minute + 60 - self.last > edge:
+            return 'MISSING_END_TICK'
+        if self.last <= self.first or self.gap > gap:
+            return 'TICK_GAP'
+        return None
 
 
 @dataclass(frozen=True)
@@ -123,7 +135,7 @@ class Series:
             return 'BUY' if expected == -1 else 'SELL'
         return None
 
-    def tick(self, ts, price):
+    def tick(self, ts, price, demo_tolerance=False):
         minute = int(ts // 60) * 60
         if self.bar and ts <= self.bar.last:
             return False
@@ -133,7 +145,7 @@ class Series:
             if minute - self.bar.minute != 60:
                 self.closed.clear()
         if not self.bar or closed:
-            self.bar = Bar(minute,ts,ts,price,price)
+            self.bar = Bar(minute,ts,ts,price,price,demo_tolerance=demo_tolerance)
         else:
             self.bar.gap = max(self.bar.gap, ts-self.bar.last)
             self.bar.last = ts
@@ -226,7 +238,7 @@ class Scanner:
             series = self.series.setdefault(asset, Series())
             if series.bar and ts <= series.bar.last:
                 continue
-            rolled = series.tick(ts, price)
+            rolled = series.tick(ts, price,self.strict_focus)
             bar = series.bar
             if not self.enabled or self.discard == asset or (held_at_start is not None and asset != held_at_start):
                 continue
@@ -237,11 +249,18 @@ class Scanner:
                         self.last_second = True
                     if asset == held and rolled and bar.minute >= boundary:
                         direction = series.direction(series.closed) if bar.minute == boundary else None
-                        if direction and now < boundary+3 and self.eligible(asset):
+                        closed = series.closed[-1] if series.closed else None
+                        gap_issue = closed.coverage_issue if closed and closed.minute == boundary-60 else 'MISSING_CANDLE'
+                        code = 'MATCH' if direction else (gap_issue or 'CLOSE_COLOR_MISMATCH')
+                        if direction and not self.eligible(asset):
+                            code = 'PAYOUT_OR_EXECUTION_GATE'
+                        self.last_closed = f'{asset}: {series.ready_depth()}/5 | {code}'
+                        self.closed_checks[code] += 1
+                        if code == 'MATCH' and now < boundary+3:
                             self.entries.append(Entry(asset,direction,boundary,boundary+3,False))
                             self.last_wait = f'{asset}: تأكّد الإغلاق'
                         else:
-                            self.last_wait = f'{asset}: ' + ('أغلق بالنمط لكن العائد غير مؤهل' if direction else 'إغلاق معاكس أو شمعة غير مكتملة')
+                            self.last_wait = f'{asset}: لا دخول | {code}'
                         self.locked = None
                     continue
                 if self.entries or not self.eligible(asset):
@@ -251,7 +270,8 @@ class Scanner:
                     direction = series.direction(series.closed) if depth >= 5 else None
                     code = ('NO_PRIOR_FOCUS' if self.strict_focus else 'MATCH') if direction else ('PATTERN' if depth >= 5 else 'WARMUP')
                     self.closed_checks[code] += 1
-                    self.last_closed = f'{asset}: {depth}/5 | {code}'
+                    issue = series.closed[-1].coverage_issue if series.closed else None
+                    self.last_closed = f'{asset}: {depth}/5 | {code}' + (f' / {issue}' if issue else '')
                     if direction and not self.strict_focus:
                         self.last_candidate = (asset,bar.minute)
                         self.on_select(asset)
