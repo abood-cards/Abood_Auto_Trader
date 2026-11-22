@@ -170,6 +170,7 @@ class Scanner:
         self.strict_focus = False
         self.history_only = False
         self.confirm_history = False
+        self.precision_lead = None
         self.proof = None
         self.lock_snapshot = None
         self.confirm_rows = None
@@ -307,6 +308,54 @@ class Scanner:
                 series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
         self.history_state = f'{asset}: تاريخ M1 جاهز (4/4؛ حي {len(live)})'
 
+    def precision_direction(self, asset, boundary, now):
+        if not self.precision_lead or not 0 < boundary-now <= self.precision_lead:
+            return None
+        series = self.series.get(asset)
+        bar = series.bar if series else None
+        clock = self.clocks.get(asset)
+        if (not bar or bar.minute != boundary-60 or self.history_asset != asset
+                or self.history_minute != bar.minute or not 0 <= now-bar.last <= 1
+                or not clock or clock.reason == 'LOCAL_CLOCK_CHANGED_RECALIBRATING'
+                or clock.last_server is None or clock.offset is None
+                or not 0 <= now-(clock.last_server-clock.offset) <= 1):
+            return None
+        if (self.running_open is not None and bar.opened != self.running_open
+                or self.running_open is None and (bar.history_open or bar.first-bar.minute > 1)):
+            return None
+        return Series.direction([*list(series.closed)[-4:],bar])
+
+    def precision_check(self):
+        if not self.locked or not self.precision_lead:
+            return
+        asset,boundary = self.locked
+        now = self.clock()
+        remaining = boundary-now
+        if remaining > self.precision_lead:
+            return
+        self.locked = None
+        series = self.series.get(asset)
+        bar = series.bar if series else None
+        direction = self.precision_direction(asset,boundary,now)
+        expected = Series.expected(series.closed) if series else 0
+        color = bar.color if bar and bar.minute == boundary-60 else None
+        if remaining <= 0:
+            code = 'ENTRY_WINDOW_MISSED'
+        elif direction and self.enabled and self.allowed(asset) and self.catalog.get(asset,True) and self.eligible and self.eligible(asset):
+            code = 'PRE_CLOSE_MATCH'
+            self.proof = Entry(asset,direction,boundary,boundary,True)
+            self.entries.append(self.proof)
+        elif direction:
+            code = 'PAYOUT_OR_EXECUTION_GATE'
+        elif color in (-1,1) and expected and color != expected:
+            code = 'قبل الإغلاق كانت حمراء بدل الخضراء' if color == -1 else 'قبل الإغلاق كانت خضراء بدل الحمراء'
+        else:
+            code = 'PRE_CLOSE_UNVERIFIED'
+        shown = {-1:'أحمر',0:'محايد',1:'أخضر'}.get(color,'غير متاح')
+        self.last_wait = self.last_closed = f'{asset}: {code}'
+        self.closed_checks[code] += 1
+        print(f'[PRE_CLOSE] {asset} remaining={remaining:.3f}s live={shown} | {code}',flush=True)
+
     def verify_close(self):
         if not self.locked or not self.lock_snapshot or not self.confirm_rows:
             return
@@ -401,6 +450,8 @@ class Scanner:
                     held,boundary = self.locked
                     if asset == held and not self.last_second and 0 < boundary-now <= 1:
                         self.last_second = True
+                    if self.precision_lead:
+                        continue  # the deadline watcher is the sole first-entry producer
                     if self.confirm_history:
                         if asset == held:
                             self.verify_close()

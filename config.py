@@ -30,6 +30,11 @@ IS_DEMO = 1 if ACCOUNT_TYPE == 'PRACTICE' else 0
 ASSET = os.getenv('ASSET', 'EURUSD_otc')
 TRADE_AMOUNT = number('TRADE_AMOUNT', 1)
 DURATION_SECONDS = 60
+DEMO_PRE_CLOSE = os.getenv('DEMO_PRE_CLOSE', 'true').strip().lower() in ('1','true','yes','on')
+ENTRY_LEAD_SECONDS = number('ENTRY_LEAD_SECONDS', .3)
+if not 0 < ENTRY_LEAD_SECONDS <= 1:
+    raise ValueError('ENTRY_LEAD_SECONDS must be in (0, 1]')
+DEMO_SCAN_SECONDS = 3
 ENTRY_DELAY_SECONDS = number('ENTRY_DELAY_SECONDS', .8)
 MARTINGALE_STEPS = number('MARTINGALE_STEPS', 4, True)
 LOOP_DELAY_SECONDS = number('LOOP_DELAY_SECONDS', 0)

@@ -6,6 +6,7 @@ import secrets
 import time
 from uuid import uuid4
 from chess_transport import ChessPocket
+import config
 from render_accounts import resolve_account, AccountConfigError
 from risk_limits import risk_state
 from diagnostics import SafeIssue
@@ -159,12 +160,24 @@ class TradingWorker:
         handled_focus = None
         finished_target = None
         last_scope = None
+        console_row = None
+        fast = bool(scanner.precision_lead)
+        history_wait = config.DEMO_SCAN_SECONDS if fast else 12
         while self.po.connected and not self.stop_event.is_set():
             now = time.monotonic()
             scope = self.repo.doc.get('scan', scan_scope.defaults())
             if scope != last_scope:
                 last_scope = scope
                 probe_at = now
+            if fast and target:
+                series = scanner.series.get(target)
+                bar = series.bar if series else None
+                if bar and scanner.history_checked == (target,bar.minute):
+                    colors = {-1:'🔴',0:'⚪',1:'🟢'}
+                    row = (target,bar.minute,tuple(c.color for c in list(series.closed)[-4:]),bar.color)
+                    if row[:3] != console_row:
+                        console_row = row[:3]
+                        print(f'[5-CANDLES] {target} {bar.minute} ' + ' '.join(colors[x] for x in row[2]) + f' | المفتوحة {colors[row[3]]}',flush=True)
             if scanner.last_candidate != handled_focus and not scanner.locked:
                 handled_focus = scanner.last_candidate
                 finished_target = target
@@ -189,14 +202,14 @@ class TradingWorker:
                 history_mode = scanner.history_only and scanner.history_asset == target and target is not None
                 checked_history = bool(scanner.history_checked and scanner.history_checked[0] == target)
                 hold = (target in candidates and target != finished_target and (
-                    (history_mode and not checked_history and age < 12) or
+                    (history_mode and (fast or not checked_history) and age < history_wait) or
                     (not history_mode and target in live and depth < 4 and not parallel and age < COLLECT_WINDOW)))
                 if hold:
-                    self.scan_state = (f'{target}: انتظار رد التاريخ (حتى 12ث)' if history_mode else f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة')
+                    self.scan_state = (f'{target}: فحص التاريخ (حتى {history_wait}ث)' if history_mode else f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة')
                     probe_at = now+.5
                 else:
                     choices = candidates if history_mode else [a for a in candidates if a not in live]
-                    if history_mode and choices == [target] and age < 12:
+                    if history_mode and choices == [target] and age < history_wait:
                         choices = []
                     asset = next(iter(choices),None)
                     if asset is not None:
@@ -205,6 +218,8 @@ class TradingWorker:
                         target = self.scan_target = self.cursor = asset
                         requested_wall,requested_mono = scanner.clock(),now
                         self.scan_state = f'{asset}: طلب بث'
+                        if fast:
+                            print(f'[SCAN] {asset} | طلب آخر شموع M1',flush=True)
                         async with asyncio.timeout(4):
                             await self.po.subscribe(asset)
                     else:
@@ -214,15 +229,16 @@ class TradingWorker:
 
     async def chain(self, entry, settings):
         scanner = self.po.scanner
-        if scanner.confirm_history:
+        if scanner.confirm_history or scanner.precision_lead:
             if scanner.proof is not entry:
                 self.last_signal = 'لم يُرسل: لا يوجد تأكيد تاريخي مطابق'
                 return
             scanner.proof = None
         self.focus = entry.asset
         t = settings['trading']
-        # Setting 4 means four regular orders total, matching the previous bot.
-        levels = max(1,t['martingale_steps'])
+        # Precision demo uses the local script convention: base + N doubles.
+        # Keep legacy semantics on the confirmed-close path and REAL.
+        levels = 1+t['martingale_steps'] if entry.early else max(1,t['martingale_steps'])
         rec = settings['recovery']
         regular_losses = 0
         next_deadline = entry.expires_at
@@ -249,7 +265,11 @@ class TradingWorker:
             return mark < price if entry.direction=='BUY' else mark > price
         for step in range(total):
             if preopened is None:
-                if not valid(next_deadline):
+                def send_valid():
+                    return valid(next_deadline) and (not entry.early or step != 0 or (
+                        settings['account_mode'] == 'PRACTICE' and self.po.mode == 'PRACTICE'
+                        and scanner.precision_direction(entry.asset,entry.boundary,scanner.clock()) == entry.direction))
+                if not send_valid():
                     self.last_signal = f'{entry.asset} {entry.direction} | لم يُرسل: انتهت نافذة الدخول أو تغيّر شرط التنفيذ'
                     break
                 order = make_order(step)
@@ -260,7 +280,7 @@ class TradingWorker:
                 self.in_flight = True
                 await self.repo.reserve(order)
                 order['sent_at'] = time.time()
-                if not await self.po.send_order(order,lambda:valid(next_deadline)):
+                if not await self.po.send_order(order,send_valid):
                     await self.repo.resolve(order,None,None,None,0,dispatched=False)
                     self.in_flight = False
                     self.last_signal = f'{entry.asset} {entry.direction} | رفض قبل الإرسال: الحساب أو الرصيد أو صلاحية الإشارة'
@@ -350,7 +370,9 @@ class TradingWorker:
                         or (scanner.locked is not None and asset == scanner.locked[0])
                         or self.keep_warming(asset))
                     scanner.on_select = self.focus_selected
-                    scanner.strict_focus = scanner.history_only = scanner.confirm_history = mode == 'PRACTICE'
+                    scanner.strict_focus = scanner.history_only = mode == 'PRACTICE'
+                    scanner.precision_lead = config.ENTRY_LEAD_SECONDS if mode == 'PRACTICE' and config.DEMO_PRE_CLOSE else None
+                    scanner.confirm_history = mode == 'PRACTICE' and not scanner.precision_lead
                     confirmation_requested = None
                     probe = asyncio.create_task(self.probe())
                     delay = 1
@@ -365,6 +387,9 @@ class TradingWorker:
                             break
                         scanner.enabled = bool(self.po.account_verified and self.po.verified_balance is not None)
                         scanner.expire_focus()
+                        if self.repo.doc['account_mode'] != mode:
+                            break
+                        scanner.precision_check()
                         self.stage = 'مسح M1' if scanner.enabled else 'مسح للقراءة فقط — انتظار تأكيد نوع الحساب والرصيد'
                         if scanner.locked:
                             if scanner.confirm_history and time.time() >= scanner.locked[1] and confirmation_requested != scanner.locked:
@@ -375,7 +400,7 @@ class TradingWorker:
                                 except TimeoutError:
                                     pass
                             if scanner.locked:
-                                self.stage = f'تركيز: {scanner.locked[0]} — ' + ('آخر ثانية؛ انتظار إغلاق مؤكد' if scanner.last_second else 'انتظار إغلاق الشمعة')
+                                self.stage = f'تركيز: {scanner.locked[0]} — ' + ('فحص اللون اللحظي قبل الإغلاق' if scanner.precision_lead else ('آخر ثانية؛ انتظار إغلاق مؤكد' if scanner.last_second else 'انتظار إغلاق الشمعة'))
                         elif (time.monotonic()-connected_at >= 30 and self.payout_due(scanner,time.monotonic())):
                             self.last_refresh = time.monotonic()
                             self.refresh_attempts += 1
@@ -397,7 +422,8 @@ class TradingWorker:
                                 await self.chain(entry,deepcopy(self.repo.doc))
                                 self.cursor = entry.asset
                                 self.focus = None
-                        await asyncio.sleep(.05)
+                        remaining = scanner.locked[1]-scanner.clock() if scanner.locked else float('inf')
+                        await asyncio.sleep(.01 if scanner.precision_lead and remaining <= 2 else .05)
                 except Exception as exc:
                     print('[CHESS]',type(exc).__name__,flush=True)
                     if self.pending:

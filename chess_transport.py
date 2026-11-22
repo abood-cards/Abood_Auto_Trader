@@ -212,7 +212,7 @@ class ChessPocket(CloudPocket):
         self.payout_book.feed(event)
         if self.mode == 'PRACTICE' and isinstance(payload,dict):
             history = payload.get('data') if isinstance(payload.get('data'),dict) else payload
-            if kind in HISTORY_EVENTS:
+            if kind in HISTORY_EVENTS or (self.scanner.precision_lead and type(history.get('index')) is int and kind in ('updatehistorynew','updatehistorynewfast','updatehistory','m1history')):
                 self.process_indexed_history({**payload,**history})
             elif not self.scanner.history_only and ('candles' in history or kind in ('updatehistorynew','updatehistory','stream_update','m1history')):
                 if history is not payload:
@@ -239,6 +239,8 @@ class ChessPocket(CloudPocket):
             return
         self.pending_history = None
         data = payload.get('data')
+        if self.scanner.precision_lead and not isinstance(data,list):
+            data = payload.get('candles')
         if not isinstance(data,list) or not data:
             self.scanner.history_state = f'{asset}: رد التاريخ فارغ'
             return
@@ -259,8 +261,9 @@ class ChessPocket(CloudPocket):
                 await self.select_asset(asset,60)
                 if self.scanner.history_only:
                     index = secrets.randbits(48) or 1
-                    self.pending_history = (asset,index,time.monotonic()+12)
-                    request = dict(asset=asset,period=60,time=int(time.time()),offset=420,index=index)
+                    fast = bool(self.scanner.precision_lead)
+                    self.pending_history = (asset,index,time.monotonic()+(3 if fast else 12))
+                    request = dict(asset=asset,period=60,time=int(time.time()),offset=900 if fast else 420,index=index)
                     await self.ws.send('42'+json.dumps(['loadHistoryPeriod',request],separators=(',',':')))
             else:
                 await self.select_asset(asset,5)
