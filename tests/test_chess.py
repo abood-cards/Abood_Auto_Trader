@@ -67,7 +67,7 @@ class MarketTests(unittest.TestCase):
 
     def test_partial_pattern(self):
         s,t,end=self.setup_bars([-1,-1,1,-1]); t(end+.2,100); t(end+45,100)
-        self.assertFalse(s.forming()[2]); t(end+50,101)
+        self.assertEqual(s.forming()[2],'AUDCAD_otc'); t(end+50,101)
         self.assertEqual(s.forming()[::2],(4,'AUDCAD_otc')); self.assertFalse(s.entries)
 
     def test_binary_and_unnamed(self):

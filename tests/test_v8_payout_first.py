@@ -45,7 +45,7 @@ class PayoutFirstTests(unittest.TestCase):
         s=Scanner(); b=PayoutBook('PRACTICE'); w.po=SimpleNamespace(scanner=s,payout_book=b)
         b.feed(['updateAssets',[{'asset':'USDCOP_otc','payout':91}]])
         self.assertFalse(w.payout_due(s,time.monotonic()))
-        b.quotes['USDCOP_otc'].at-=61
+        b.quotes['USDCOP_otc'].at-=361
         self.assertTrue(w.payout_due(s,time.monotonic()))
         s.locked=('USDCOP_otc',6300)
         self.assertFalse(w.payout_due(s,time.monotonic()))
@@ -60,7 +60,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         s=Scanner(); b=PayoutBook('PRACTICE')
         s.catalog=dict.fromkeys(['AUDUSD','BTCUSD','EURUSD','USDJPY'],True)
         b.feed(['updateAssets',[{'asset':'AUDUSD','payout':50},{'asset':'BTCUSD','payout':91},{'asset':'USDJPY','payout':92}]])
-        b.quotes['BTCUSD'].at-=61
+        b.quotes['BTCUSD'].at-=361
         called=[]
         async def subscribe(asset):
             called.append(asset);w.stop_event.set()

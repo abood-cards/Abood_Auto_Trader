@@ -78,5 +78,5 @@ class WorkerScanTests(unittest.IsolatedAsyncioTestCase):
         for quote in w.po.payout_book.quotes.values(): quote.at=t[0]
         with patch('worker.time.monotonic',lambda: t[0]), patch('worker.asyncio.sleep',advance):
             await w.probe()
-        self.assertEqual(seen,sorted(ASSETS))
+        self.assertEqual(seen,['AEDCNY_otc','EURUSD','BTCUSD','#AAPL_otc'])
         self.assertEqual(w.probed,set(ASSETS))

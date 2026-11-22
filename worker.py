@@ -11,7 +11,8 @@ from risk_limits import risk_state
 from diagnostics import SafeIssue
 from payout_guard import scan_payout, SCAN_PAYOUT_MIN, SCAN_PAYOUT_MAX
 
-PAYOUT_REFRESH_INTERVAL = 60
+PAYOUT_REFRESH_INTERVAL = 360
+SCAN_QUOTE_MIN_AGE_LIMIT = 360
 import scan_scope
 
 
@@ -98,7 +99,7 @@ class TradingWorker:
 
     def payout(self, asset):
         book = getattr(self.po,'payout_book',None)
-        return scan_payout(book,asset,self.repo.doc['payout']['max_age_seconds'])
+        return scan_payout(book,asset,max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc['payout']['max_age_seconds']))
 
     def allowed_asset(self, asset):
         return scan_scope.allowed(self.repo.doc.get('scan',scan_scope.defaults()), asset, self.po.scanner.groups)
@@ -130,6 +131,19 @@ class TradingWorker:
     def focus_selected(self, asset):
         self.cursor = asset
 
+    def scan_key(self, asset):
+        group = self.po.scanner.groups.get(asset) or scan_scope.category(asset)
+        groups = tuple(scan_scope.LABELS)
+        _,rate = self.payout(asset)
+        return (groups.index(group) if group in groups else len(groups),
+                -(rate if rate is not None else -1),asset.casefold(),asset)
+
+    def scan_order(self, sources):
+        # Filtering before scheduling is equivalent to skipping the rest of a
+        # descending payout group at its first <90 row. Missing/stale never enter.
+        return sorted((a for a,on in sources.items() if on and self.allowed_asset(a)
+                       and self.payout(a)[0]=='KNOWN'),key=self.scan_key)
+
     async def probe(self):
         """Equal rotation when only one feed is available; concurrent streams are all scanned."""
         scanner = self.po.scanner
@@ -154,7 +168,13 @@ class TradingWorker:
             if not self.focus and not scanner.locked and not scanner.entries and not self.po.wrong_mode and now >= probe_at:
                 sources = {**{a:q.tradable is not False for a,q in self.po.payout_book.quotes.items()},
                            **scanner.catalog}
-                candidates = scan_scope.circular((a for a,on in sources.items() if on and self.allowed_asset(a) and self.payout(a)[0]=='KNOWN'),self.cursor)
+                candidates = self.scan_order(sources)
+                if self.cursor in candidates:
+                    pos = candidates.index(self.cursor)+1
+                    candidates = candidates[pos:]+candidates[:pos]
+                elif self.cursor:
+                    cursor_key = self.scan_key(self.cursor)
+                    candidates = [a for a in candidates if self.scan_key(a)>cursor_key]+[a for a in candidates if self.scan_key(a)<=cursor_key]
                 live = set(scanner.active_assets())
                 single = target in live and len(live) == 1
                 testing_parallel = len(checked) == 1 and any(a not in checked for a in candidates)
@@ -322,7 +342,7 @@ class TradingWorker:
                         self.stage = 'مسح M1' if scanner.enabled else 'مسح للقراءة فقط — انتظار تأكيد نوع الحساب والرصيد'
                         if scanner.locked:
                             self.stage = f'تركيز: {scanner.locked[0]} — ' + ('آخر ثانية؛ انتظار إغلاق مؤكد' if scanner.last_second else 'انتظار إغلاق الشمعة')
-                        elif (time.monotonic()-connected_at >= 15 and self.payout_due(scanner,time.monotonic())):
+                        elif (time.monotonic()-connected_at >= 30 and self.payout_due(scanner,time.monotonic())):
                             self.last_refresh = time.monotonic()
                             self.refresh_attempts += 1
                             self.stage = 'تحديث جدول العوائد — إعادة اتصال متسلسلة'
@@ -418,5 +438,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status}\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status} | صلاحية حتى {max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc["payout"]["max_age_seconds"]):g} ث\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))

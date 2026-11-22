@@ -261,7 +261,7 @@ class Scanner:
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
-                if (0 < remaining <= 60 and expected and bar.color == expected
+                if (0 < remaining <= 60 and expected
                         and bar.first-bar.minute <= 3 and bar.gap <= 10):
                     self.locked = self.last_candidate = (asset,bar.minute+60)
                     self.last_second = 0 < remaining <= 1
@@ -292,7 +292,7 @@ class Scanner:
             remaining = bar.minute + 60 - now
             expected = series.expected(closed)
             if (0 < remaining <= 60 and closed and closed[-1].minute+60 == bar.minute
-                    and expected and bar.color == expected):
+                    and expected):
                 candidates.append((4,bar.last,asset))
         return max(candidates, default=(0,0,None))
 

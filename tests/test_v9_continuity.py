@@ -56,7 +56,7 @@ class ContinuityTests(unittest.IsolatedAsyncioTestCase):
         book=PayoutBook('PRACTICE'); w.po=SimpleNamespace(payout_book=book)
         book.feed(['updateAssets',[{'asset':'AUDCAD_otc','payout':92},{'asset':'EURUSD','payout':91}]])
         self.assertTrue(w.keep_warming('AUDCAD_otc'))
-        for q in book.quotes.values(): q.at=time.monotonic()-61
+        for q in book.quotes.values(): q.at=time.monotonic()-361
         self.assertTrue(w.keep_warming('AUDCAD_otc'))
         self.assertFalse(w.keep_warming('EURUSD'))
         self.assertEqual(w.payout('AUDCAD_otc')[0],'STALE')
