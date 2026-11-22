@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: abood-auto-trader-chess
+    runtime: python
+    plan: starter
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u run.py
+    healthCheckPath: /health
+    envVars:
+      - key: CONTROL_BOT_TOKEN
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: DB_NAME
+        value: abood_chess_db
+      - key: PO_SSID_DEMO
+        sync: false
+      - key: PO_WS_URL_DEMO
+        sync: false
+      - key: PO_UID_DEMO
+        sync: false
+      - key: PO_SSID_REAL
+        sync: false
+      - key: PO_WS_URL_REAL
+        sync: false
+      - key: PO_UID_REAL
+        sync: false

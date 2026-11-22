@@ -1,0 +1,240 @@
+"""Async MongoDB persistence, lease fencing and atomic single-document accounting."""
+import asyncio
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from pymongo import AsyncMongoClient, ReturnDocument
+from pymongo.write_concern import WriteConcern
+from cloud_settings import defaults, validate_document, patched, empty_stats, MODES
+from recovery import after_result, selected_state, reset_state, recovery_defaults
+from work_cycle import cycle_state
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+class Repository:
+    def __init__(self, uri, db_name, collection=None):
+        self.client = None
+        if collection is None:
+            self.client = AsyncMongoClient(uri, serverSelectionTimeoutMS=8000,
+                                           connectTimeoutMS=8000, socketTimeoutMS=10000,
+                                           tz_aware=True)
+            self.collection = self.client[db_name].get_collection(
+                'chess_settings', write_concern=WriteConcern(w='majority'))
+        else:
+            self.collection = collection  # offline test injection
+        self.owner = uuid4().hex
+        self.doc = None
+        self.lock = asyncio.Lock()
+        self.leader = False
+
+    async def initialize(self):
+        if self.client:
+            await self.client.admin.command('ping')
+        await self.collection.update_one({'_id': 'current_settings'},
+                                         {'$setOnInsert': defaults()}, upsert=True)
+        raw = await self.collection.find_one({'_id': 'current_settings'})
+        # Merge new schema defaults in RAM, without overriding any stored values.
+        def merge(a, b):
+            for k, v in b.items():
+                if k not in a:
+                    a[k] = deepcopy(v)
+                elif isinstance(v, dict) and isinstance(a[k], dict):
+                    merge(a[k], v)
+            return a
+        previous = deepcopy(raw)
+        self.doc = validate_document(merge(raw, defaults()))
+        if self.leader:
+            missing = {}
+            def collect(old, new, prefix=''):
+                for key, value in new.items():
+                    path = prefix + key
+                    if key not in old:
+                        missing[path] = deepcopy(value)
+                    elif isinstance(value, dict) and isinstance(old[key], dict):
+                        collect(old[key], value, path + '.')
+            collect(previous, self.doc)
+            if missing:
+                result = await self.collection.update_one(self.fence(), {'$set': missing})
+                if result.matched_count != 1:
+                    raise RuntimeError('lease_lost')
+        return self.doc
+
+    def fence(self):
+        return {'_id': 'current_settings', 'lease.owner': self.owner,
+                'lease.expires_at': {'$gt': utcnow()}}
+
+    async def acquire(self):
+        now = utcnow()
+        q = {'_id': 'current_settings', '$or': [
+            {'lease.expires_at': {'$lte': now}},
+            {'lease': {'$exists': False}}, {'lease.owner': self.owner}]}
+        doc = await self.collection.find_one_and_update(q, {'$set': {
+            'lease': {'owner': self.owner, 'expires_at': now + timedelta(seconds=30)}}},
+            return_document=ReturnDocument.AFTER)
+        self.leader = doc is not None
+        if self.leader:
+            # persist any missing schema fields after acquiring the only writer lease
+            await self.initialize()
+        return self.leader
+
+    async def renew(self):
+        r = await self.collection.update_one(self.fence(), {'$set': {
+            'lease.expires_at': utcnow() + timedelta(seconds=30)}})
+        self.leader = r.matched_count == 1
+        if not self.leader:
+            raise RuntimeError('lease_lost')
+
+    async def release(self):
+        await self.collection.update_one({'_id': 'current_settings', 'lease.owner': self.owner},
+                                         {'$unset': {'lease': ''}})
+        self.leader = False
+
+    async def update(self, fields):
+        async with self.lock:
+            new_doc = patched(self.doc, fields)
+            writes = deepcopy(fields)
+            if new_doc['schedule']!=self.doc['schedule']:
+                writes['runtime.cycle']=cycle_state()
+                new_doc['runtime']['cycle']=cycle_state()
+            # Settings edits never overwrite finances. New sizing / recovery policy
+            # explicitly cancels old recovery phases; old in-flight epochs cannot revive them.
+            reset_all = (new_doc['recovery'] != self.doc['recovery'] or
+                         new_doc['trading']['trade_amount'] != self.doc['trading']['trade_amount'])
+            credential_modes = {mode for mode, key in (('REAL','real_account'), ('PRACTICE','demo_account'))
+                                if new_doc[key] != self.doc[key]}
+            reset_modes = set(MODES) if reset_all else credential_modes
+            if reset_modes:
+                for mode in reset_modes:
+                    value = reset_state(selected_state(self.doc, mode))
+                    writes['runtime.recovery.' + mode] = value
+                    new_doc['runtime']['recovery'][mode] = value
+                writes.update({'runtime.martingale_step': 0, 'runtime.sizing_signature': None})
+                new_doc['runtime'].update(martingale_step=0, sizing_signature=None)
+            r = await self.collection.update_one(self.fence(), {'$set': writes})
+            if r.matched_count != 1:
+                raise RuntimeError('lease_lost')
+            # DB first: a failed write is never reported as a saved setting.
+            self.doc = new_doc
+
+    async def save_cycle(self,state,expected):
+        async with self.lock:
+            if self.doc['schedule']!=expected:return False
+            result=await self.collection.update_one(self.fence(),{'$set':{'runtime.cycle':deepcopy(state)}})
+            if result.matched_count!=1:raise RuntimeError('lease_lost')
+            self.doc['runtime']['cycle']=deepcopy(state)
+            return True
+
+    async def reserve(self, order):
+        async with self.lock:
+            q = self.fence()
+            q['runtime.pending'] = None
+            r = await self.collection.update_one(q, {'$set': {'runtime.pending': order}})
+            if r.matched_count != 1:
+                raise RuntimeError('pending_or_lease_lost')
+            self.doc['runtime']['pending'] = deepcopy(order)
+
+    async def reserve_followup(self, primary, followup):
+        async with self.lock:
+            q = self.fence()
+            q.update({'runtime.pending.id':primary['id'],'runtime.pending.followup':None})
+            result = await self.collection.update_one(q,{'$set':{'runtime.pending.followup':followup}})
+            if result.matched_count != 1:
+                raise RuntimeError('followup_reservation_failed')
+            self.doc['runtime']['pending']['followup'] = deepcopy(followup)
+
+    async def discard_followup(self, primary, followup):
+        async with self.lock:
+            q = self.fence()
+            q.update({'runtime.pending.id':primary['id'],'runtime.pending.followup.id':followup['id']})
+            result = await self.collection.update_one(q,{'$unset':{'runtime.pending.followup':''}})
+            if result.matched_count != 1:
+                raise RuntimeError('followup_discard_failed')
+            self.doc['runtime']['pending'].pop('followup',None)
+
+    async def resolve(self, order, result, before, after, next_step, dispatched=True,
+                      seq_lost=0, seq_lost_amount=0.0):
+        """Idempotent by pending ID. Unknown finances are never counted as full loss."""
+        amount = order['amount']
+        mode = order['mode']
+        q = self.fence()
+        q['runtime.pending.id'] = order['id']
+        inc = {}
+        if dispatched:
+            values = {'total_trades': 1, 'total_staked': amount}
+            if result in ('win', 'loss', 'draw'):
+                key = {'win': 'won_trades', 'loss': 'lost_trades', 'draw': 'draws'}[result]
+                values[key] = 1
+                if before is not None and after is not None:
+                    delta = round(after - before, 6)
+                    values.update(net_pnl=delta, total_returned=round(max(0, amount+delta), 6),
+                                  financial_trades=1)
+            else:
+                values['unconfirmed'] = 1
+            if seq_lost:
+                values['sequence_losses'] = seq_lost
+                values['lost_amount'] = round(seq_lost_amount, 6)
+            for prefix in ('session_stats', 'account_stats.' + mode):
+                inc.update({prefix + '.' + k: v for k, v in values.items()})
+        update = {'$set': {'runtime.pending': None, 'runtime.martingale_step': next_step,
+                           'runtime.sizing_signature': order.get('sizing_signature')}}
+        if inc:
+            update['$inc'] = inc
+        async with self.lock:
+            followup = deepcopy((self.doc['runtime'].get('pending') or {}).get('followup'))
+            update['$set']['runtime.pending'] = followup
+            previous = selected_state(self.doc, mode)
+            current = previous
+            if dispatched:
+                current = after_result(self.doc.get('recovery', recovery_defaults()), previous,
+                                       order, result, before, after, seq_lost)
+            changed_phase = current['epoch'] != previous['epoch']
+            effective_step = 0 if changed_phase else next_step
+            update['$set']['runtime.martingale_step'] = effective_step
+            update['$set']['runtime.recovery.' + mode] = current
+            r = await self.collection.update_one(q, update)
+            if r.matched_count != 1:
+                raise RuntimeError('result_already_saved_or_lease_lost')
+            self.doc['runtime'].update(pending=followup, martingale_step=effective_step,
+                                       sizing_signature=order.get('sizing_signature'))
+            self.doc['runtime'].setdefault('recovery', {})[mode] = current
+            for path, v in inc.items():
+                parts = path.split('.')
+                node = self.doc
+                for p in parts[:-1]:
+                    node = node.setdefault(p, {})
+                node[parts[-1]] = node.get(parts[-1], 0) + v
+
+    async def acknowledge_pending(self):
+        order = self.doc['runtime'].get('pending')
+        if order:
+            # Unknown order is explicitly archived as unconfirmed, not retried.
+            await self.resolve(order, None, None, None, 0, dispatched=True)
+
+    async def reset_step(self):
+        async with self.lock:
+            r = await self.collection.update_one(self.fence(), {'$set': {'runtime.martingale_step': 0}})
+            if r.matched_count != 1:
+                raise RuntimeError('lease_lost')
+            self.doc['runtime']['martingale_step'] = 0
+
+    async def reset_stats(self):
+        """Zero all statistics and the martingale step (ledger reset on user request)."""
+        async with self.lock:
+            update = {'$set': {'session_stats': empty_stats(),
+                               'account_stats': {m: empty_stats() for m in MODES},
+                               'runtime.martingale_step': 0,
+                               'runtime.recovery': {m: reset_state(selected_state(self.doc, m)) for m in MODES}}}
+            r = await self.collection.update_one(self.fence(), update)
+            if r.matched_count != 1:
+                raise RuntimeError('lease_lost')
+            self.doc['session_stats'] = empty_stats()
+            self.doc['account_stats'] = {m: empty_stats() for m in MODES}
+            self.doc['runtime']['martingale_step'] = 0
+            self.doc['runtime']['recovery'] = deepcopy(update['$set']['runtime.recovery'])
+
+    async def close(self):
+        if self.client:
+            await self.client.close()

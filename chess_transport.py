@@ -46,6 +46,8 @@ class Decoder(EventDecoder):
         try:
             data = payload_json(raw)
             if isinstance(data,dict):
+                if 'candles' in data and ('asset' in data or 'symbol' in data):
+                    return [['m1History',data]]
                 name = data.get('event')
                 if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream'}):
                     return [[name,data.get('data',data.get('payload',{}))]]
@@ -200,6 +202,13 @@ class ChessPocket(CloudPocket):
         if kind not in BALANCE_EVENTS and isinstance(payload,dict) and 'isDemo' in payload and flag(payload['isDemo']) is not expected:
             return
         self.payout_book.feed(event)
+        if self.mode == 'PRACTICE' and isinstance(payload,dict):
+            history = payload.get('data') if isinstance(payload.get('data'),dict) else payload
+            if 'candles' in history or kind in ('updatehistorynew','updatehistory','stream_update','m1history'):
+                if history is not payload:
+                    history = {**payload,**history}
+                if 'isDemo' not in history or flag(history['isDemo']) is True:
+                    self.scanner.accept_history(history)
         self.scanner.feed(event)
         if not self.wrong_mode:
             for tracked in self.trackers:
@@ -209,8 +218,11 @@ class ChessPocket(CloudPocket):
 
     async def subscribe(self, asset):
         if self.connected and not self.wrong_mode:
-            # Match the local collector subscription; M1 bars are built offline from ticks.
-            await self.select_asset(asset,5)
+            if self.mode == 'PRACTICE' and self.scanner.strict_focus:
+                self.scanner.request_history(asset)
+                await self.select_asset(asset,60)
+            else:
+                await self.select_asset(asset,5)
             self.subscription_requests += 1
 
     async def send_order(self, order, valid):

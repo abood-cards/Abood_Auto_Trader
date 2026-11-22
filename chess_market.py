@@ -68,6 +68,7 @@ class Bar:
     close: float
     gap: float = 0
     demo_tolerance: bool = False
+    history_open: bool = False
 
     @property
     def color(self):
@@ -80,11 +81,11 @@ class Bar:
     @property
     def coverage_issue(self):
         edge, gap = (5, 20) if self.demo_tolerance else (3, 10)
-        if self.first - self.minute > edge:
+        if not self.history_open and self.first - self.minute > edge:
             return 'LATE_FIRST_TICK'
         if self.minute + 60 - self.last > edge:
             return 'MISSING_END_TICK'
-        if self.last <= self.first or self.gap > gap:
+        if (not self.history_open and self.last <= self.first) or self.gap > gap:
             return 'TICK_GAP'
         return None
 
@@ -167,6 +168,9 @@ class Scanner:
         self.allowed = lambda asset: True
         self.eligible = None  # production supplies the account payout gate
         self.strict_focus = False
+        self.history_asset = None
+        self.history_state = '—'
+        self.history_rows = None
         self.track_price = lambda asset: True
         self.payout_filtered = Counter()
         self.last_second = False
@@ -183,11 +187,85 @@ class Scanner:
         self.ticks_received = 0
 
     def clear(self):
+        self.history_asset = self.history_rows = None
+        self.history_state = '—'
         self.series.clear(); self.catalog.clear(); self.entries.clear(); self.verified.clear(); self.ticks_received = 0
         self.groups.clear(); self.locked = None; self.last_candidate = None; self.last_wait = '—'
         self.payout_filtered.clear(); self.last_second = False
         self.closed_checks.clear(); self.last_closed = '—'
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
+
+    def request_history(self, asset):
+        self.history_asset = asset
+        self.history_rows = None
+        self.history_state = f'{asset}: طلب تاريخ M1'
+
+    def accept_history(self, payload):
+        if not self.strict_focus or not isinstance(payload,dict):
+            return
+        asset = payload.get('asset',payload.get('symbol'))
+        period = num(payload.get('period',payload.get('timeframe')))
+        if not asset or asset != self.history_asset or period != 60:
+            return
+        candles = payload.get('candles',payload.get('data'))
+        if not isinstance(candles,list) or not 4 <= len(candles) <= 5000:
+            return
+        rows = {}
+        for item in candles:
+            if isinstance(item,dict):
+                values = [item.get('time',item.get('timestamp')),item.get('open'),item.get('close'),item.get('high'),item.get('low')]
+            elif isinstance(item,list) and len(item) >= 5:
+                values = item[:5]
+            else:
+                continue
+            ts,o,c,h,l = map(num,values)
+            if None in (ts,o,c,h,l) or not 0 < l <= min(o,c) <= max(o,c) <= h:
+                continue
+            if ts > 1e11:
+                ts /= 1000
+            if ts % 60:
+                continue
+            if ts in rows and rows[ts] != (o,c):
+                self.history_state = f'{asset}: تاريخ متضارب'
+                return
+            rows[ts] = (o,c)
+        self.history_rows = rows or None
+        self.history_state = f'{asset}: وصل التاريخ؛ انتظار تكة حديثة لمطابقة الدقيقة'
+
+    def seed_history(self, asset, series, ts, offset):
+        if asset != self.history_asset or self.history_rows is None:
+            return
+        rows = self.history_rows
+        self.history_rows = None
+        minute = int(ts//60)*60
+        times = tuple(range(minute-240,minute,60))
+        if all(m+offset in rows for m in times):
+            shift = offset
+        elif all(m in rows for m in times):
+            shift = 0  # historical timestamps may already be UTC
+        else:
+            self.history_state = f'{asset}: التاريخ غير متصل حتى الدقيقة الحالية'
+            return
+        # A response from the new minute may also describe the locked candle.
+        # In that case the existing live close path takes precedence.
+        if self.locked or (series.bar and series.bar.minute > minute):
+            return
+        if not series.bar or series.bar.minute != minute:
+            series.bar = None
+        existing = {b.minute:b for b in series.closed if b.minute < minute}
+        for m in times:
+            o,c=rows[m+shift]
+            existing[m]=Bar(m,m,m+59,o,c,demo_tolerance=True)
+        series.closed = deque(sorted(existing.values(),key=lambda b:b.minute)[-8:],maxlen=8)
+        if minute+shift in rows:
+            # Use the historical OPEN only. The close of the running candle
+            # must come from live ticks, never from this snapshot.
+            opening = rows[minute+shift][0]
+            if series.bar is None:
+                series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
+            elif not series.bar.good:
+                series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
+        self.history_state = f'{asset}: تاريخ M1 جاهز (4/4)'
 
     def feed(self, event):
         if not isinstance(event,list) or len(event)<2:
@@ -236,6 +314,7 @@ class Scanner:
             self.accepted += 1
             self.verified.add(asset)
             series = self.series.setdefault(asset, Series())
+            self.seed_history(asset,series,ts,clock.offset)
             if series.bar and ts <= series.bar.last:
                 continue
             rolled = series.tick(ts, price,self.strict_focus)
@@ -282,7 +361,7 @@ class Scanner:
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
-                if 0 < remaining <= 60 and expected:
+                if 0 < remaining <= 60 and expected and (not self.history_asset or self.history_asset == asset):
                     self.locked = self.last_candidate = (asset,bar.minute+60)
                     self.last_second = 0 < remaining <= 1
                     self.last_wait = f'{asset}: انتظار الإغلاق'

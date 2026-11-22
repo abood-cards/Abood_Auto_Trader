@@ -187,7 +187,7 @@ class TradingWorker:
                     any(a != target and scanner.series[a].bar.last >= requested_wall+VERIFY_PARALLEL_AFTER
                         for a in live if a in candidates))
                 hold = (target in live and target in candidates and target != finished_target
-                        and depth < 4 and not parallel and age < COLLECT_WINDOW)
+                        and depth < 4 and not parallel and age < (15 if scanner.history_asset else COLLECT_WINDOW))
                 if hold:
                     self.scan_state = f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة'
                     probe_at = now+.5
@@ -453,5 +453,5 @@ class TradingWorker:
                     f'\nساعة البث: {reason} | فرق: {correction}')
         else:
             diag = ''
-        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status} | صلاحية حتى {max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc["payout"]["max_age_seconds"]):g} ث\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}\nجدولة المسح: {('مثبّت حتى الإغلاق' if forming else self.scan_state)}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
+        return (f'{self.stage} | {self.repo.doc["account_mode"]}\n{coverage}\nالنطاق: {scope} | موضع القائمة: {self.cursor or "—"}\nهدف الاشتراك الحالي: {self.scan_target or "—"} | بث مستلم: {receiving}\nآخر 4 لـ {watched or "—"}: {candles or "—"}\nمصدر الاتصال: {source}\nطلبات الاشتراك: {subscriptions} | أصول طُلبت: {len(self.probed)}\nعائد الأصل المعروض: {rate_text} | مطابق 90–92%: {eligible}/{len(scoped_payouts)} | قديم: {stale}{payout_status} | صلاحية حتى {max(SCAN_QUOTE_MIN_AGE_LIMIT,self.repo.doc["payout"]["max_age_seconds"]):g} ث\nمحاولات تحديث العائد: {self.refresh_attempts}\nجاهزة (4 شموع متتالية): {ready}/{len(live_depths)} | أعلى تغطية: {max(live_depths,default=0)}/5\nآخر فحص إغلاق: {s.last_closed if s else chr(8212)}\nآخر نموذج مغلق: {self.last_signal}\nتاريخ M1: {s.history_state if s else chr(8212)}\nجدولة المسح: {('مثبّت حتى الإغلاق' if forming else self.scan_state)}{diag}\nتأكيد الحساب: {account} | الرصيد: {balance}\nنموذج قيد التكوّن: {formation}\nآخر تركيز: {s.last_wait if s else chr(8212)}\nالأصل قيد التنفيذ: {focus}\nقراءة آخر ثانيتين: {self.preview}'
                 + ('\n⚠️ أمر غير محسوم: تحقّق من سجل المنصة.' if self.pending else ''))
