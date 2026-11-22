@@ -203,7 +203,7 @@ class Scanner:
         self.history_checked = self.history_minute = None
         self.history_asset = asset
         self.history_rows = None
-        self.history_state = f'{asset}: طلب تاريخ M1'
+        self.history_state = f'{asset}: انتظار رد M1 الحالي'
 
     def accept_history(self, payload):
         if not self.strict_focus or not isinstance(payload,dict):

@@ -1,6 +1,7 @@
 """Single broker socket: discovery, tick ingestion, and correlated orders."""
 import asyncio
 import json
+import secrets
 import time
 import zlib
 from cloud_transport import CloudPocket
@@ -37,6 +38,9 @@ def balance_rows(payload, inherited=None, depth=0):
             yield from balance_rows(value,inherited,depth+1)
 
 
+HISTORY_EVENTS = {'loadhistoryperiod','loadhistoryperiodfast','m1historyindexed'}
+
+
 class Decoder(EventDecoder):
     def feed(self, raw):
         pending = self.pending
@@ -46,11 +50,13 @@ class Decoder(EventDecoder):
         try:
             data = payload_json(raw)
             if isinstance(data,dict):
+                if type(data.get('index')) is int and isinstance(data.get('data'),list):
+                    return [['m1HistoryIndexed',data]]
                 if 'candles' in data and ('asset' in data or 'symbol' in data):
                     return [['m1History',data]]
                 name = data.get('event')
-                if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream','updatehistorynew','updatehistory','stream_update','m1history'}):
-                    return [[name,data if 'asset' in data or 'symbol' in data else data.get('data',data.get('payload',{}))]]
+                if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream','updatehistorynew','updatehistory','stream_update','m1history'} | HISTORY_EVENTS):
+                    return [[name,data if 'asset' in data or 'symbol' in data or 'index' in data else data.get('data',data.get('payload',{}))]]
             if isinstance(data, list) and any(extract_ticks(data)):
                 return [['updateStream', data]]
         except (ValueError, TypeError, UnicodeError, RecursionError, zlib.error):
@@ -137,6 +143,7 @@ class ChessPocket(CloudPocket):
     def __init__(self, credentials, mode):
         super().__init__(credentials,mode)
         self.scanner = Scanner()
+        self.pending_history = None
         self.result = None
         self.trackers = []
         self.account_verified = False
@@ -151,6 +158,7 @@ class ChessPocket(CloudPocket):
 
     async def connect(self):
         self.scanner.clear()
+        self.pending_history = None
         self.account_verified = self.wrong_mode = self.auth_seen = False
         self.result = None
         self.trackers.clear()
@@ -204,7 +212,9 @@ class ChessPocket(CloudPocket):
         self.payout_book.feed(event)
         if self.mode == 'PRACTICE' and isinstance(payload,dict):
             history = payload.get('data') if isinstance(payload.get('data'),dict) else payload
-            if 'candles' in history or kind in ('updatehistorynew','updatehistory','stream_update','m1history'):
+            if kind in HISTORY_EVENTS:
+                self.process_indexed_history({**payload,**history})
+            elif not self.scanner.history_only and ('candles' in history or kind in ('updatehistorynew','updatehistory','stream_update','m1history')):
                 if history is not payload:
                     history = {**payload,**history}
                 if 'isDemo' not in history or flag(history['isDemo']) is True:
@@ -216,11 +226,34 @@ class ChessPocket(CloudPocket):
                 if not tracked.order.get('overlap'):
                     tracked.confirm_balance(self.verified_balance,self.verified_balance_at)
 
+    def process_indexed_history(self, payload):
+        if not self.pending_history:
+            return
+        asset,index,deadline = self.pending_history
+        if (time.monotonic() > deadline or type(payload.get('index')) is not int or payload['index'] != index
+                or payload.get('asset') not in (None,'',asset) or payload.get('symbol') not in (None,'',asset)
+                or num(payload.get('period')) not in (60,0,None) and 'period' in payload
+                or ('isDemo' in payload and flag(payload['isDemo']) is not True)):
+            return
+        if 'period' in payload and payload['period'] not in (None,0,'0',60,'60'):
+            return
+        self.pending_history = None
+        data = payload.get('data')
+        if not isinstance(data,list) or not data:
+            self.scanner.history_state = f'{asset}: رد التاريخ فارغ'
+            return
+        self.scanner.accept_history(dict(payload,asset=asset,period=60,candles=data))
+
     async def subscribe(self, asset):
         if self.connected and not self.wrong_mode:
             if self.mode == 'PRACTICE' and self.scanner.strict_focus:
                 self.scanner.request_history(asset)
                 await self.select_asset(asset,60)
+                if self.scanner.history_only:
+                    index = secrets.randbits(48) or 1
+                    self.pending_history = (asset,index,time.monotonic()+12)
+                    request = dict(asset=asset,period=60,time=int(time.time()),offset=420,index=index)
+                    await self.ws.send('42'+json.dumps(['loadHistoryPeriod',request],separators=(',',':')))
             else:
                 await self.select_asset(asset,5)
             self.subscription_requests += 1
