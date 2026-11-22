@@ -239,21 +239,28 @@ class Scanner:
         self.history_rows = None
         minute = int(ts//60)*60
         times = tuple(range(minute-240,minute,60))
-        if all(m+offset in rows for m in times):
-            shift = offset
-        elif all(m in rows for m in times):
-            shift = 0  # historical timestamps may already be UTC
-        else:
-            self.history_state = f'{asset}: التاريخ غير متصل حتى الدقيقة الحالية'
-            return
-        # A response from the new minute may also describe the locked candle.
-        # In that case the existing live close path takes precedence.
         if self.locked or (series.bar and series.bar.minute > minute):
             return
+        existing = {b.minute:b for b in series.closed if b.minute < minute}
+        # At the boundary the previous live bar has not been rolled yet.
+        if series.bar and series.bar.minute == minute-60 and series.bar.good:
+            existing[series.bar.minute] = series.bar
+        live = {m for m in times if m in existing and existing[m].good}
+        shifts = tuple(dict.fromkeys((offset,0)))
+        candidates = [(shift, {m for m in times if m+shift in rows}) for shift in shifts]
+        # Both clocks are known, not guessed. Overlapping ambiguous snapshots
+        # are not used unless exactly one yields continuity and contributes data.
+        viable = [(shift, present) for shift,present in candidates
+                  if present and len(present | live)==4]
+        if len(viable)!=1:
+            best=max((len(present | live) for _,present in candidates),default=0)
+            why='توقيت تاريخ ملتبس' if viable else 'دقائق مغلقة غير متصلة'
+            self.history_state=f'{asset}: {why} ({best}/4 | صفوف {len(rows)})'
+            return
+        shift,present=viable[0]
         if not series.bar or series.bar.minute != minute:
             series.bar = None
-        existing = {b.minute:b for b in series.closed if b.minute < minute}
-        for m in times:
+        for m in present-live:
             o,c=rows[m+shift]
             existing[m]=Bar(m,m,m+59,o,c,demo_tolerance=True)
         series.closed = deque(sorted(existing.values(),key=lambda b:b.minute)[-8:],maxlen=8)
@@ -265,7 +272,7 @@ class Scanner:
                 series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
             elif not series.bar.good:
                 series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
-        self.history_state = f'{asset}: تاريخ M1 جاهز (4/4)'
+        self.history_state = f'{asset}: تاريخ M1 جاهز (4/4؛ حي {len(live)})'
 
     def feed(self, event):
         if not isinstance(event,list) or len(event)<2:
@@ -361,7 +368,7 @@ class Scanner:
                     continue
                 remaining = bar.minute+60-now
                 expected = series.expected(series.closed) if series.closed and series.closed[-1].minute+60 == bar.minute else 0
-                if 0 < remaining <= 60 and expected and (not self.history_asset or self.history_asset == asset):
+                if 0 < remaining <= 60 and expected:
                     self.locked = self.last_candidate = (asset,bar.minute+60)
                     self.last_second = 0 < remaining <= 1
                     self.last_wait = f'{asset}: انتظار الإغلاق'

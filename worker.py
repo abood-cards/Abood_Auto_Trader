@@ -147,6 +147,11 @@ class TradingWorker:
         return sorted((a for a,on in sources.items() if on and self.allowed_asset(a)
                        and self.payout(a)[0]=='KNOWN'),key=self.scan_key)
 
+    def history_fallback(self, target, scanner):
+        # If the sole live stream has no usable history, retain it long enough
+        # to collect the four real candles rather than restarting every 15s.
+        return scanner.history_asset == target and scanner.active_count() == 1
+
     async def probe(self):
         """Equal rotation when only one feed is available; concurrent streams are all scanned."""
         scanner = self.po.scanner
@@ -187,7 +192,7 @@ class TradingWorker:
                     any(a != target and scanner.series[a].bar.last >= requested_wall+VERIFY_PARALLEL_AFTER
                         for a in live if a in candidates))
                 hold = (target in live and target in candidates and target != finished_target
-                        and depth < 4 and not parallel and age < (15 if scanner.history_asset else COLLECT_WINDOW))
+                        and depth < 4 and not parallel and age < (COLLECT_WINDOW if not scanner.history_asset or self.history_fallback(target, scanner) else 15))
                 if hold:
                     self.scan_state = f'{target}: تجميع {depth}/4 — لا تبديل أثناء التهيئة'
                     probe_at = now+.5

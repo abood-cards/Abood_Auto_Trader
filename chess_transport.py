@@ -49,8 +49,8 @@ class Decoder(EventDecoder):
                 if 'candles' in data and ('asset' in data or 'symbol' in data):
                     return [['m1History',data]]
                 name = data.get('event')
-                if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream'}):
-                    return [[name,data.get('data',data.get('payload',{}))]]
+                if isinstance(name,str) and name.lower() in (BALANCE_EVENTS | {'updatestream','updatehistorynew','updatehistory','stream_update','m1history'}):
+                    return [[name,data if 'asset' in data or 'symbol' in data else data.get('data',data.get('payload',{}))]]
             if isinstance(data, list) and any(extract_ticks(data)):
                 return [['updateStream', data]]
         except (ValueError, TypeError, UnicodeError, RecursionError, zlib.error):
