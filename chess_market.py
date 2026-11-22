@@ -169,6 +169,12 @@ class Scanner:
         self.eligible = None  # production supplies the account payout gate
         self.strict_focus = False
         self.history_only = False
+        self.confirm_history = False
+        self.proof = None
+        self.lock_snapshot = None
+        self.confirm_rows = None
+        self.history_shift = None
+        self.running_open = None
         self.history_checked = None
         self.history_minute = None
         self.history_asset = None
@@ -190,6 +196,8 @@ class Scanner:
         self.ticks_received = 0
 
     def clear(self):
+        self.proof = self.lock_snapshot = self.confirm_rows = None
+        self.history_shift = self.running_open = None
         self.history_checked = self.history_minute = None
         self.history_asset = self.history_rows = None
         self.history_state = '—'
@@ -200,12 +208,14 @@ class Scanner:
         self.clocks.clear(); self.rejected.clear(); self.accepted = 0; self.last_clock = None
 
     def request_history(self, asset):
+        self.proof = self.lock_snapshot = self.confirm_rows = None
+        self.history_shift = self.running_open = None
         self.history_checked = self.history_minute = None
         self.history_asset = asset
         self.history_rows = None
         self.history_state = f'{asset}: انتظار رد M1 الحالي'
 
-    def accept_history(self, payload):
+    def accept_history(self, payload, confirmation=False):
         if not self.strict_focus or not isinstance(payload,dict):
             return
         asset = payload.get('asset',payload.get('symbol'))
@@ -240,6 +250,10 @@ class Scanner:
         if not rows:
             self.history_state = f'{asset}: رد M1 بلا صفوف OHLC صالحة'
             return
+        if confirmation:
+            self.confirm_rows = rows
+            self.verify_close()
+            return
         merged = dict(self.history_rows or {})
         merged.update(rows)
         self.history_rows = dict(sorted(merged.items())[-5000:])
@@ -273,6 +287,8 @@ class Scanner:
             self.history_state=f'{asset}: {why} ({best}/4 | صفوف {len(rows)} | فرق أحدث صف {latest:+d}ث)'
             return
         shift,present=viable[0]
+        self.history_shift = shift
+        self.running_open = rows.get(minute+shift,(None,None))[0]
         self.history_rows = None
         self.history_minute = minute
         if not series.bar or series.bar.minute != minute:
@@ -290,6 +306,41 @@ class Scanner:
             elif not series.bar.good:
                 series.bar = Bar(minute,ts,ts-0.001,opening,opening,demo_tolerance=True,history_open=True)
         self.history_state = f'{asset}: تاريخ M1 جاهز (4/4؛ حي {len(live)})'
+
+    def verify_close(self):
+        if not self.locked or not self.lock_snapshot or not self.confirm_rows:
+            return
+        asset,boundary=self.locked
+        now=self.clock()
+        if not boundary <= now < boundary+3:
+            return
+        if not self.enabled or not self.allowed(asset) or not self.catalog.get(asset,True):
+            return
+        shift,prior,opening=self.lock_snapshot
+        series=self.series.get(asset)
+        if not series or not series.bar or series.bar.minute != boundary or not 0 <= now-series.bar.last <= 1:
+            return
+        rows=self.confirm_rows
+        last=rows.get(boundary-60+shift)
+        direction=None
+        if boundary+shift not in rows or last is None:
+            code='UNVERIFIED_CLOSE'
+        elif any(rows.get(m+shift)!=(o,c) for m,o,c in prior) or (opening is not None and last[0]!=opening):
+            code='OHLC_CHANGED'
+        else:
+            bars=[Bar(m,m,m+59,o,c) for m,o,c in prior]
+            bars.append(Bar(boundary-60,boundary-60,boundary-1,*last))
+            direction=Series.direction(bars)
+            code='VERIFIED' if direction and self.eligible(asset) else ('PAYOUT_OR_EXECUTION_GATE' if direction else 'CLOSE_COLOR_MISMATCH')
+        self.confirm_rows=None
+        self.locked=None
+        self.last_closed=f'{asset}: {code} | M1 UTC {boundary-60}'
+        self.last_wait=self.last_closed
+        self.closed_checks[code]+=1
+        if code=='VERIFIED':
+            self.proof=Entry(asset,direction,boundary,boundary+3,False)
+            self.entries.append(self.proof)
+            print(f'[CHESS VERIFIED] {asset} {direction} close_utc={boundary} OHLC_OC={[ (m,o,c) for m,o,c in prior]+[(boundary-60,*last)]}',flush=True)
 
     def feed(self, event):
         if not isinstance(event,list) or len(event)<2:
@@ -350,6 +401,10 @@ class Scanner:
                     held,boundary = self.locked
                     if asset == held and not self.last_second and 0 < boundary-now <= 1:
                         self.last_second = True
+                    if self.confirm_history:
+                        if asset == held:
+                            self.verify_close()
+                        continue
                     if asset == held and rolled and bar.minute >= boundary:
                         direction = series.direction(series.closed) if bar.minute == boundary else None
                         closed = series.closed[-1] if series.closed else None
@@ -393,6 +448,9 @@ class Scanner:
                         self.history_state = f'{asset}: 4/4 — الألوان لا تطابق النموذج'
                 if 0 < remaining <= 60 and expected:
                     self.locked = self.last_candidate = (asset,bar.minute+60)
+                    if self.confirm_history:
+                        self.lock_snapshot = (self.history_shift,tuple((b.minute,b.opened,b.close) for b in list(series.closed)[-4:]),self.running_open)
+                        self.confirm_rows = None
                     self.last_second = 0 < remaining <= 1
                     self.last_wait = f'{asset}: انتظار الإغلاق'
                     self.on_select(asset)

@@ -213,8 +213,13 @@ class TradingWorker:
             await asyncio.sleep(.25)
 
     async def chain(self, entry, settings):
-        self.focus = entry.asset
         scanner = self.po.scanner
+        if scanner.confirm_history:
+            if scanner.proof is not entry:
+                self.last_signal = 'لم يُرسل: لا يوجد تأكيد تاريخي مطابق'
+                return
+            scanner.proof = None
+        self.focus = entry.asset
         t = settings['trading']
         # Setting 4 means four regular orders total, matching the previous bot.
         levels = max(1,t['martingale_steps'])
@@ -345,7 +350,8 @@ class TradingWorker:
                         or (scanner.locked is not None and asset == scanner.locked[0])
                         or self.keep_warming(asset))
                     scanner.on_select = self.focus_selected
-                    scanner.strict_focus = scanner.history_only = mode == 'PRACTICE'
+                    scanner.strict_focus = scanner.history_only = scanner.confirm_history = mode == 'PRACTICE'
+                    confirmation_requested = None
                     probe = asyncio.create_task(self.probe())
                     delay = 1
                     while self.po.connected and not self.stop_event.is_set():
@@ -361,7 +367,15 @@ class TradingWorker:
                         scanner.expire_focus()
                         self.stage = 'مسح M1' if scanner.enabled else 'مسح للقراءة فقط — انتظار تأكيد نوع الحساب والرصيد'
                         if scanner.locked:
-                            self.stage = f'تركيز: {scanner.locked[0]} — ' + ('آخر ثانية؛ انتظار إغلاق مؤكد' if scanner.last_second else 'انتظار إغلاق الشمعة')
+                            if scanner.confirm_history and time.time() >= scanner.locked[1] and confirmation_requested != scanner.locked:
+                                confirmation_requested = scanner.locked
+                                try:
+                                    async with asyncio.timeout(.7):
+                                        await self.po.request_close_history(*confirmation_requested)
+                                except TimeoutError:
+                                    pass
+                            if scanner.locked:
+                                self.stage = f'تركيز: {scanner.locked[0]} — ' + ('آخر ثانية؛ انتظار إغلاق مؤكد' if scanner.last_second else 'انتظار إغلاق الشمعة')
                         elif (time.monotonic()-connected_at >= 30 and self.payout_due(scanner,time.monotonic())):
                             self.last_refresh = time.monotonic()
                             self.refresh_attempts += 1

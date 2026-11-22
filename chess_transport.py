@@ -229,7 +229,7 @@ class ChessPocket(CloudPocket):
     def process_indexed_history(self, payload):
         if not self.pending_history:
             return
-        asset,index,deadline = self.pending_history
+        asset,index,deadline,*purpose = self.pending_history
         if (time.monotonic() > deadline or type(payload.get('index')) is not int or payload['index'] != index
                 or payload.get('asset') not in (None,'',asset) or payload.get('symbol') not in (None,'',asset)
                 or num(payload.get('period')) not in (60,0,None) and 'period' in payload
@@ -242,7 +242,15 @@ class ChessPocket(CloudPocket):
         if not isinstance(data,list) or not data:
             self.scanner.history_state = f'{asset}: رد التاريخ فارغ'
             return
-        self.scanner.accept_history(dict(payload,asset=asset,period=60,candles=data))
+        self.scanner.accept_history(dict(payload,asset=asset,period=60,candles=data),confirmation=bool(purpose))
+
+    async def request_close_history(self, asset, boundary):
+        if not self.connected or self.wrong_mode or self.mode != 'PRACTICE' or self.scanner.locked!=(asset,boundary):
+            return
+        index=secrets.randbits(48) or 1
+        self.pending_history=(asset,index,time.monotonic()+max(0,boundary+3-time.time()),boundary)
+        request=dict(asset=asset,period=60,time=int(time.time()),offset=420,index=index)
+        await self.ws.send('42'+json.dumps(['loadHistoryPeriod',request],separators=(',',':')))
 
     async def subscribe(self, asset):
         if self.connected and not self.wrong_mode:
